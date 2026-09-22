@@ -9,6 +9,10 @@ namespace BeaconBox\Model;
  *
  * `$opened` is the one worth acting on: it is the difference between "we sent it" and "they have
  * it", and it is what `escalateIfUnreadAfterMinutes` waits on.
+ *
+ * `$notSent` is the one worth checking *before* you wait for any of them. A non-null value means
+ * no email was ever attempted and none will be, so polling `$delivered` for this message will
+ * never terminate. See {@see NotSent}.
  */
 final class DeliveryStatus
 {
@@ -21,6 +25,7 @@ final class DeliveryStatus
         public readonly ?\DateTimeImmutable $openedAt = null,
         public readonly ?\DateTimeImmutable $bouncedAt = null,
         public readonly ?SmsDelivery $sms = null,
+        public readonly ?NotSent $notSent = null,
         public readonly array $raw = [],
     ) {
     }
@@ -37,6 +42,9 @@ final class DeliveryStatus
             Parse::nullableDatetime($payload, 'bounced_at'),
             isset($payload['sms']) && \is_array($payload['sms'])
                 ? SmsDelivery::fromArray($payload['sms'])
+                : null,
+            isset($payload['not_sent']) && \is_array($payload['not_sent'])
+                ? NotSent::fromArray($payload['not_sent'])
                 : null,
             $payload,
         );

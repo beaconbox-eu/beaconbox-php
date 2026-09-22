@@ -1,0 +1,51 @@
+name: Release gate
+
+# Pushing a tag `vX.Y.Z` is what publishes a release.
+#
+# **Nothing is uploaded from here.** Packagist reads the tag from this repository through its
+# GitHub App, so a release is the tag existing. That makes this workflow a gate rather than a
+# publisher: it runs before Packagist has had a chance to sync, and a red run is the signal to
+# delete the tag before anybody installs it.
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  gate:
+    name: Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          # The floor composer.json declares. Testing on it rather than on the newest runtime is
+          # the point: a consumer on 8.1 is the one who finds an 8.2-only syntax.
+          php-version: '8.1'
+          extensions: curl, json
+          coverage: none
+          tools: composer:v2
+
+      # Packagist derives the released version from the tag and never reads Version::VERSION, so
+      # nothing else would notice the two disagreeing — while every request the SDK makes carries
+      # the constant in its User-Agent.
+      - name: Verify the tag matches Version::VERSION
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(php -r "require 'src/Version.php'; echo BeaconBox\\Version::VERSION;")"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::tag $TAG_VERSION does not match Version::VERSION $PKG_VERSION"
+            exit 1
+          fi
+          echo "releasing $PKG_VERSION"
+
+      - name: Install
+        run: composer install --no-interaction --no-progress --prefer-dist
+
+      - name: Test
+        run: composer test
+
+      - name: Static analysis
+        run: composer analyse -- --no-progress

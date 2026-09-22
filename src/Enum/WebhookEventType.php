@@ -22,6 +22,9 @@ enum WebhookEventType: string
     case MessageBounced = 'message.bounced';
     case MessageFailed = 'message.failed';
     case MessageComplained = 'message.complained';
+    /** No email was sent at all, and why — the payload carries `reason`. Not `message.failed`:
+     *  nothing was attempted and nothing bounced. */
+    case MessageNotSent = 'message.not_sent';
     case SmsDelivered = 'sms.delivered';
     case SmsFailed = 'sms.failed';
     case SmsRejected = 'sms.rejected';
@@ -31,4 +34,11 @@ enum WebhookEventType: string
     case WhatsAppRead = 'whatsapp.read';
     case WhatsAppInboundMessage = 'whatsapp.inbound_message';
     case CreditsLowBalance = 'credits.low_balance';
+    /** The card failed and email sending stops at `period_end`. There is still time to fix it. */
+    case PlanPastDue = 'plan.past_due';
+    /** The paid period ended and email sending has stopped. Every nudge from here produces a
+     *  `message.not_sent` with `reason: "plan_lapsed"` until the subscription is paid. */
+    case PlanLapsed = 'plan.lapsed';
+    /** The period's included email allowance is used up. Nothing stops — it is billable. */
+    case PlanAllowanceExceeded = 'plan.allowance_exceeded';
 }

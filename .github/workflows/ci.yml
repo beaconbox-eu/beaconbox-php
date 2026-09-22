@@ -1,0 +1,38 @@
+name: CI
+
+# Unit tests only. The live suite is a separate PHPUnit testsuite that needs a running BeaconBox
+# and is exercised in the private platform repository before a release is cut.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: PHP ${{ matrix.php }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # 8.1 is the declared floor and the version a consumer is most likely to be on; the rest
+      # catch a deprecation before somebody else's upgrade does.
+      matrix:
+        php: ['8.1', '8.2', '8.3', '8.4']
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up PHP ${{ matrix.php }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: curl, json
+          coverage: none
+          tools: composer:v2
+
+      - name: Install
+        run: composer install --no-interaction --no-progress --prefer-dist
+
+      - name: Test
+        run: composer test
+
+      - name: Static analysis
+        run: composer analyse -- --no-progress

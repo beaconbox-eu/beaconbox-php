@@ -5,10 +5,12 @@ declare(strict_types=1);
 namespace BeaconBox\Tests;
 
 use BeaconBox\Enum\Channel;
+use BeaconBox\Enum\EmailSkipReason;
 use BeaconBox\Enum\MessageKind;
 use BeaconBox\Enum\MessageStatus;
 use BeaconBox\Enum\RecipientStatus;
 use BeaconBox\Enum\SkipReason;
+use BeaconBox\Model\DeliveryStatus;
 use BeaconBox\Model\Message;
 use BeaconBox\Model\MessagePush;
 use BeaconBox\Model\MessagePushResult;
@@ -246,6 +248,56 @@ final class ModelsTest extends TestCase
         self::assertNotNull($message->delivery->sms);
         self::assertSame('delivered', $message->delivery->sms->status->value ?? null);
         self::assertNotNull($message->delivery->sms->submittedAt);
+    }
+
+    /**
+     * `delivery.notSent` — the field that tells a caller when to stop polling.
+     *
+     * Before it existed, `delivered === false` meant both *on its way* and *never attempted, and
+     * never will be*, so an integration waiting on a delivery the server had already declined to
+     * attempt waited forever.
+     */
+    public function testADeliveryWithNoRefusalHasNoNotSentBlock(): void
+    {
+        $delivery = DeliveryStatus::fromArray(['delivered' => false, 'opened' => false, 'bounced' => false]);
+
+        self::assertNull($delivery->notSent);
+    }
+
+    public function testARefusalCarriesItsReasonAndTime(): void
+    {
+        $delivery = DeliveryStatus::fromArray([
+            'delivered' => false,
+            'opened' => false,
+            'bounced' => false,
+            'not_sent' => ['reason' => 'plan_lapsed', 'at' => '2026-09-22T10:00:00Z'],
+        ]);
+
+        self::assertNotNull($delivery->notSent);
+        self::assertSame(EmailSkipReason::PlanLapsed->value, $delivery->notSent->reason);
+        self::assertNotNull($delivery->notSent->at);
+    }
+
+    /**
+     * The load-bearing one, and why `reason` is a string rather than the enum.
+     *
+     * The server's list grows whenever a refusal is added to the send path. An SDK that threw on
+     * a value it had not heard of would turn an additive server change into a fatal in a
+     * merchant's job runner — for a message it was being told about precisely because something
+     * needed attention.
+     */
+    public function testAnUnknownReasonParsesRatherThanThrowing(): void
+    {
+        $delivery = DeliveryStatus::fromArray([
+            'delivered' => false,
+            'opened' => false,
+            'bounced' => false,
+            'not_sent' => ['reason' => 'some_future_reason'],
+        ]);
+
+        self::assertNotNull($delivery->notSent);
+        self::assertSame('some_future_reason', $delivery->notSent->reason);
+        self::assertNull($delivery->notSent->at);
     }
 
     public function testAWebhookEventKeepsItsDataUntouched(): void
