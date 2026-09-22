@@ -28,7 +28,7 @@ $result = $client->messages->push(new MessagePush(
     kind: MessageKind::Updateable,
 ));
 
-echo $result->id;  // m_8sKq2Vd1
+echo $result->id;  // 3xg39cvt8a46
 ```
 
 The customer gets an email whose link opens their inbox already signed in. No password, no account
@@ -89,14 +89,14 @@ key rather than only the retries this SDK makes internally.
 
 ```php
 // Delivery status
-$message = $client->messages->get('m_8sKq2Vd1');
+$message = $client->messages->get('3xg39cvt8a46');
 $message->delivery->opened;
 
 // Every message, following cursors. A generator, so a year of history is not held in memory
 foreach ($client->messages->each(recipientEmail: 'buyer@example.com') as $message) { /* … */ }
 
 // Take one back: withdrawn for the recipient, any queued nudge called off, no credit spent
-$client->messages->retract('m_8sKq2Vd1');
+$client->messages->retract('3xg39cvt8a46');
 
 // Up to 100 pushes. Always 200: read ->failed, not the status code
 $result = $client->messages->pushBatch([$one, $two]);
