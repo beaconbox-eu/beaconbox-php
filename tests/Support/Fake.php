@@ -30,18 +30,26 @@ final class Fake
     public const BASE_URL = 'https://api.beaconbox.test';
 
     /**
+     * The three settings a test may want to vary are named parameters rather than three separate
+     * factories, so a test that varies one does not have to restate the other two.
+     *
      * @param list<ResponseInterface|ConnectionFailure> $responses
      *
      * @return array{0: BeaconBoxClient, 1: RecordingClient}
      */
-    public static function client(array $responses = [], ?RetryPolicy $retryPolicy = null): array
-    {
+    public static function client(
+        array $responses = [],
+        ?RetryPolicy $retryPolicy = null,
+        string $apiKey = self::API_KEY,
+        string $baseUrl = self::BASE_URL,
+        ?string $userAgentSuffix = null,
+    ): array {
         $http = new RecordingClient($responses === [] ? [new Response(200, [], '{}')] : $responses);
         $psr17 = new Psr17Factory();
 
         $client = new BeaconBoxClient(
-            self::API_KEY,
-            self::BASE_URL,
+            $apiKey,
+            $baseUrl,
             5_000,
             // Zero retries by default so a test that is not about retrying does not silently make
             // three requests and pass anyway. Zero delays everywhere so the suite never sleeps.
@@ -49,9 +57,16 @@ final class Fake
             $http,
             $psr17,
             $psr17,
+            userAgentSuffix: $userAgentSuffix,
         );
 
         return [$client, $http];
+    }
+
+    /** The balance response, the cheapest call to make when a test is about the request. */
+    public static function balance(): Response
+    {
+        return self::json(200, ['balance' => 0, 'low_balance' => false, 'threshold' => 0]);
     }
 
     /**

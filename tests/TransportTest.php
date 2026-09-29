@@ -15,6 +15,7 @@ use BeaconBox\Exception\ResourceMissingException;
 use BeaconBox\Exception\ServerException;
 use BeaconBox\Model\MessagePush;
 use BeaconBox\RetryPolicy;
+use BeaconBox\Version;
 use BeaconBox\Tests\Support\ConnectionFailure;
 use BeaconBox\Tests\Support\Fake;
 use Nyholm\Psr7\Response;
@@ -281,6 +282,66 @@ final class TransportTest extends TestCase
         }
     }
 
+    public function testAFractionalRetryAfterIsHonoured(): void
+    {
+        // The README promises both SDKs back off identically down to the constants, and the Python
+        // one reads `1.5` as 1.5 seconds. `ctype_digit` refused it, so the same 429 from the same
+        // server produced a server-directed wait in one language and an invented one in the other.
+        [$client] = Fake::client([Fake::json(429, [], ['Retry-After' => '1.5'])]);
+
+        try {
+            $client->messages->push($this->push());
+            self::fail('expected a RateLimitException');
+        } catch (RateLimitException $exception) {
+            self::assertSame(1_500, $exception->retryAfterMs);
+        }
+    }
+
+    /** @return list<array{string}> */
+    public static function absurdRetryAfterValues(): array
+    {
+        return [['99999999999999999999'], [str_repeat('9', 40)]];
+    }
+
+    #[DataProvider('absurdRetryAfterValues')]
+    public function testAnAbsurdRetryAfterIsCappedRatherThanOverflowed(string $value): void
+    {
+        // `((int) $seconds) * 1000` overflows to a float, and the parser declares `?int` under
+        // `strict_types`, so a broken or hostile header turned a 429 into a TypeError thrown from
+        // inside the retry loop. The caller still gets a rate-limit error with "absurdly long" on
+        // it, and the policy still refuses to sit through it.
+        [$client] = Fake::client([Fake::json(429, [], ['Retry-After' => $value])]);
+
+        try {
+            $client->messages->push($this->push());
+            self::fail('expected a RateLimitException');
+        } catch (RateLimitException $exception) {
+            self::assertSame(PHP_INT_MAX, $exception->retryAfterMs);
+            self::assertFalse((new RetryPolicy())->shouldRetry(429, 0, $exception->retryAfterMs));
+        }
+    }
+
+    /** @return list<array{string}> */
+    public static function unusableRetryAfterValues(): array
+    {
+        // The HTTP-date form is legal and essentially never used by an API; parsing it would mean
+        // trusting the caller's clock to agree with the server's.
+        return [['Wed, 21 Oct 2026 07:28:00 GMT'], ['-5'], ['soon'], [''], ['1e3'], ['0x10']];
+    }
+
+    #[DataProvider('unusableRetryAfterValues')]
+    public function testAnUnusableRetryAfterFallsBackToOurOwnBackoff(string $value): void
+    {
+        [$client] = Fake::client([Fake::json(429, [], ['Retry-After' => $value])]);
+
+        try {
+            $client->messages->push($this->push());
+            self::fail('expected a RateLimitException');
+        } catch (RateLimitException $exception) {
+            self::assertNull($exception->retryAfterMs);
+        }
+    }
+
     public function testAnErrorWithoutTheHeaderHasNoRetryAfter(): void
     {
         [$client] = Fake::client([Fake::json(429)]);
@@ -430,6 +491,148 @@ final class TransportTest extends TestCase
         // Otherwise a typo in configuration puts a live API key on the wire in clear.
         $this->expectExceptionMessage('plain http');
         new BeaconBoxClient(Fake::API_KEY, 'http://api.beaconbox.test');
+    }
+
+    /** @return list<array{string}> */
+    public static function urlsCarryingAQueryOrFragment(): array
+    {
+        return [
+            ['https://api.beaconbox.test?x=1'],
+            ['https://api.beaconbox.test/#frag'],
+            ['https://api.beaconbox.test/v2?token=abc'],
+            // A bare delimiter with nothing after it. This works because the check uses `isset()`
+            // on the parsed component rather than testing it for truth — an empty query string is
+            // still a query string, and it breaks the URL identically. Pinned so the check is not
+            // "simplified" into a truthiness test, which is the bug the Python SDK had here.
+            ['https://api.beaconbox.test?'],
+            ['https://api.beaconbox.test#'],
+            ['https://api.beaconbox.test/?'],
+            ['https://api.beaconbox.test/#'],
+        ];
+    }
+
+    #[DataProvider('urlsCarryingAQueryOrFragment')]
+    public function testABaseUrlWithAQueryOrFragmentIsRefused(string $url): void
+    {
+        // It would not fail, it would go somewhere else: `request()` appends `/api/v1/...` and then
+        // its own `?`, so `https://host?x=1` silently became `https://host?x=1/api/v1/credits` —
+        // the whole API path swallowed into a query value, against an endpoint nobody chose.
+        $this->expectExceptionMessage('query string or fragment');
+        new BeaconBoxClient(Fake::API_KEY, $url);
+    }
+
+    public function testABaseUrlMayCarryAPathPrefix(): void
+    {
+        // A gateway that mounts BeaconBox under a prefix is a real deployment, unlike a query.
+        [$client, $http] = Fake::client([Fake::balance()], baseUrl: 'https://gateway.test/beaconbox');
+
+        $client->credits->balance();
+
+        self::assertSame('https://gateway.test/beaconbox/api/v1/credits', (string) $http->only()->getUri());
+    }
+
+    /** @return list<array{string}> */
+    public static function keysThatCannotGoInAHeader(): array
+    {
+        return [
+            ["bbx\r\nX-Injected: 1"],
+            ["bbx_live\nAuthorization: Bearer other"],
+            ["bbx_live_\x00abc"],
+            ["bbx_live_a\tb"],
+            ['bbx_live_caf' . "\u{e9}"],
+        ];
+    }
+
+    #[DataProvider('keysThatCannotGoInAHeader')]
+    public function testAnApiKeyThatCannotGoInAHeaderIsRefused(string $key): void
+    {
+        // A `\r\n` in the key is request smuggling with the caller's own credential: curl does not
+        // sanitise what it is handed in CURLOPT_HTTPHEADER. The usual cause is innocent — a key read
+        // from a file keeps its trailing newline, or a word processor substituted a quote mark.
+        $this->expectExceptionMessage('cannot go in an HTTP header');
+        new BeaconBoxClient($key);
+    }
+
+    public function testTheRefusalNeverQuotesTheKey(): void
+    {
+        // This message reaches a log. The key it is complaining about must not.
+        try {
+            new BeaconBoxClient("bbx_live_secretvalue\r\nX-Injected: 1");
+            self::fail('expected the key to be refused');
+        } catch (\InvalidArgumentException $exception) {
+            self::assertStringNotContainsString('secretvalue', $exception->getMessage());
+        }
+    }
+
+    public function testSurroundingWhitespaceIsStillForgiven(): void
+    {
+        // Stripped, not refused: a key pasted with a trailing newline is the normal case.
+        [$client, $http] = Fake::client([Fake::balance()], apiKey: ' ' . Fake::API_KEY . "\n");
+
+        $client->credits->balance();
+
+        self::assertSame('Bearer ' . Fake::API_KEY, $http->only()->getHeaderLine('Authorization'));
+    }
+
+    public function testAUserAgentSuffixIdentifiesTheIntegration(): void
+    {
+        [$client, $http] = Fake::client([Fake::balance()], userAgentSuffix: 'acme-shop/2.1');
+
+        $client->credits->balance();
+
+        $agent = $http->only()->getHeaderLine('User-Agent');
+        self::assertStringStartsWith('beaconbox-php/', $agent);
+        self::assertStringEndsWith(' acme-shop/2.1', $agent);
+    }
+
+    /** @return list<array{string, string}> */
+    public static function userAgentSuffixes(): array
+    {
+        // Byte for byte what the Python SDK produces for the same input. The README promises the two
+        // behave the same, and a `User-Agent` that differs between them is the kind of difference
+        // nobody notices until it is in a support conversation about which client sent what.
+        return [
+            ['acme-shop/2.1', 'acme-shop/2.1'],
+            ["acme\r\nX-Injected: 1", 'acme X-Injected: 1'],
+            ["a\tb", 'a b'],
+            ['  padded  ', 'padded'],
+            ["caf\u{e9}", 'caf'],
+        ];
+    }
+
+    #[DataProvider('userAgentSuffixes')]
+    public function testASuffixIsMadeHeaderSafe(string $suffix, string $expected): void
+    {
+        // A label for a human to read must not be able to become a second header, and must not be
+        // able to fail a constructor either.
+        [$client, $http] = Fake::client([Fake::balance()], userAgentSuffix: $suffix);
+
+        $client->credits->balance();
+
+        $agent = $http->only()->getHeaderLine('User-Agent');
+        $base = 'beaconbox-php/' . Version::VERSION . ' php/' . PHP_VERSION;
+        self::assertSame($base . ' ' . $expected, $agent);
+        self::assertSame(1, preg_match('/^[\x20-\x7e]+$/', $agent), 'header-safe throughout');
+    }
+
+    /** @return list<array{string|null}> */
+    public static function emptySuffixes(): array
+    {
+        return [[null], [''], ['   '], ["\r\n"]];
+    }
+
+    #[DataProvider('emptySuffixes')]
+    public function testAnEmptySuffixLeavesNoTrailingSpace(?string $suffix): void
+    {
+        // A dangling space would be a User-Agent that differs from the default for no reason.
+        [$client, $http] = Fake::client([Fake::balance()], userAgentSuffix: $suffix);
+
+        $client->credits->balance();
+
+        self::assertSame(
+            'beaconbox-php/' . Version::VERSION . ' php/' . PHP_VERSION,
+            $http->only()->getHeaderLine('User-Agent'),
+        );
     }
 
     public function testPlainHttpToLoopbackIsAllowed(): void

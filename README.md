@@ -199,11 +199,16 @@ $client = new BeaconBoxClient(
     baseUrl: 'https://api.beaconbox.eu',
     timeoutMs: 30_000,
     retryPolicy: new BeaconBox\RetryPolicy(maxRetries: 2),
+    userAgentSuffix: 'acme-shop/2.1',
 );
 ```
 
 Inside a job runner that already retries, pass `new RetryPolicy(maxRetries: 0)` so the two
 schedules do not multiply.
+
+`userAgentSuffix` is appended to the `User-Agent`, so your integration is identifiable in a support
+conversation. It is a label for a human to read, so anything that cannot go in a header value is
+stripped from it rather than refused.
 
 ### Backpressure
 
@@ -256,8 +261,16 @@ remembered to hide and the field added next year is not on it.
   redirect points.
 - `CURLOPT_SSL_VERIFYPEER` and `VERIFYHOST` are set explicitly, so a php.ini or a system curl
   config that has turned them off cannot silently disable certificate verification.
+- **An API key that cannot go in a header is refused at construction** — a control character, a
+  newline or a non-ASCII character. curl does not sanitise what it is handed, so a `\r\n` inside
+  the key would be request smuggling with your own credential as the payload. Surrounding
+  whitespace is trimmed, because a key read from a file keeps its trailing newline.
+- **A `baseUrl` with a query string or a fragment is refused**, because it would not fail, it would
+  go somewhere else. A path prefix is fine, for a gateway that mounts BeaconBox under one.
 - The API key is redacted from `var_dump`, and so are `NewApiKey::$key` and a webhook endpoint's
-  secret.
+  secret — from `json_encode` too, which is the path a structured logger actually takes. Note that
+  `var_export`, `serialize` and `->raw` accept no hook and still carry the value: read the property,
+  store it, drop the object.
 - Webhook signatures are compared with `hash_equals`, over a signed timestamp.
 
 Behind a corporate CA or a private staging certificate? Pass `caBundle:` a path to a PEM file.

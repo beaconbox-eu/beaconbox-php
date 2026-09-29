@@ -50,6 +50,16 @@ final class Transport
     /** Plain http is permitted only to these, where nothing leaves the machine. */
     private const LOCAL_HOSTS = ['localhost', '127.0.0.1', '::1'];
 
+    /**
+     * Trimmed, which is not cosmetic.
+     *
+     * The constructor used to check `trim($apiKey)` for emptiness and then store the *untrimmed*
+     * value, so the commonest way a key arrives — `file_get_contents` on a secret file, or a `.env`
+     * line with trailing whitespace — put `Bearer bbx_live_…\n` on the wire. That is either a 401
+     * nobody can explain from a key that looks correct, or a newline inside a header value. The
+     * Python SDK has always stripped; this brings the two into line.
+     */
+    private readonly string $apiKey;
     private readonly string $baseUrl;
     private readonly RetryPolicy $retryPolicy;
     private readonly LoggerInterface $logger;
@@ -61,10 +71,11 @@ final class Transport
      * default path, so it is the one that has to cost nothing.
      */
     private readonly bool $logging;
+    private readonly string $userAgent;
     private ?\CurlHandle $curlHandle = null;
 
     public function __construct(
-        private readonly string $apiKey,
+        string $apiKey,
         ?string $baseUrl = null,
         private readonly int $timeoutMs = self::DEFAULT_TIMEOUT_MS,
         ?RetryPolicy $retryPolicy = null,
@@ -73,11 +84,27 @@ final class Transport
         private readonly ?StreamFactoryInterface $streamFactory = null,
         private readonly ?string $caBundle = null,
         ?LoggerInterface $logger = null,
+        ?string $userAgentSuffix = null,
     ) {
         if ($apiKey === '' || trim($apiKey) === '') {
             throw new \InvalidArgumentException('BeaconBox: an API key is required.');
         }
+        // Anything that cannot go in a header value: a control character, or non-ASCII. An API key
+        // is base62, so this refuses nothing legitimate. What it catches is a `\r\n` reaching
+        // CURLOPT_HTTPHEADER, which is request smuggling with the caller's own credential as the
+        // payload — curl does not sanitise the strings it is handed. The message never quotes the
+        // key, because the message goes in a log.
+        $this->apiKey = trim($apiKey);
+        if (preg_match('/[^\x20-\x7e]/', $this->apiKey) === 1) {
+            throw new \InvalidArgumentException(
+                'BeaconBox: the API key contains a character that cannot go in an HTTP header '
+                . '(a control character, a newline or a non-ASCII character). A key read from a '
+                . 'file or an environment variable often keeps a stray newline or a substituted '
+                . 'quote mark; check the value rather than this call.',
+            );
+        }
         $this->baseUrl = self::validateBaseUrl($baseUrl ?? self::DEFAULT_BASE_URL);
+        $this->userAgent = self::buildUserAgent($userAgentSuffix);
         $this->retryPolicy = $retryPolicy ?? new RetryPolicy();
         // NullLogger, never a concrete one. The default has to be silence.
         $this->logger = $logger ?? new NullLogger();
@@ -138,7 +165,7 @@ final class Transport
         $headers = [
             'Authorization' => 'Bearer ' . $this->apiKey,
             'Accept' => 'application/json',
-            'User-Agent' => 'beaconbox-php/' . Version::VERSION . ' php/' . PHP_VERSION,
+            'User-Agent' => $this->userAgent,
         ];
         if ($body !== null) {
             $headers['Content-Type'] = 'application/json';
@@ -413,6 +440,17 @@ final class Transport
      * used by an API, and parsing it would mean trusting the caller's clock to agree with the
      * server's, which is the assumption that makes it worse than our own backoff.
      *
+     * **A fractional value counts**, which `ctype_digit` alone refused. The README promises the two
+     * SDKs back off identically down to the constants, and the Python one reads `Retry-After: 1.5`
+     * as 1.5 seconds; refusing it here meant the same 429 from the same server produced a
+     * server-directed wait in one language and an invented backoff in the other.
+     *
+     * **The result is capped rather than multiplied blindly.** `(int) $seconds * 1000` overflows to
+     * a `float` for an absurd header value, and this method declares `?int` under `strict_types`,
+     * so a broken or hostile `Retry-After: 99999999999999999999` turned a 429 into a `TypeError`
+     * thrown from inside the retry loop. The cap is far beyond any `maxRetryAfterMs`, so the policy
+     * still refuses to wait it out and the caller still sees "absurdly long" on the exception.
+     *
      * @param array<string, string> $headers
      */
     private static function retryAfterMs(array $headers): ?int
@@ -422,8 +460,13 @@ final class Transport
                 continue;
             }
             $trimmed = trim($value);
+            if (preg_match('/^\d+(\.\d+)?$/', $trimmed) !== 1) {
+                return null;
+            }
+            $seconds = (float) $trimmed;
+            $ceiling = (float) intdiv(PHP_INT_MAX, 1000);
 
-            return ctype_digit($trimmed) ? ((int) $trimmed) * 1000 : null;
+            return $seconds >= $ceiling ? PHP_INT_MAX : (int) round($seconds * 1000);
         }
 
         return null;
@@ -465,6 +508,13 @@ final class Transport
      * this SDK's own live tests run against. Anywhere else it means the bearer token, the
      * recipient's email address and the body of the message are readable by anything on the path,
      * and an SDK that shrugs at that is the reason it happens in production.
+     *
+     * A **path** is allowed, for a deployment behind a gateway that mounts BeaconBox under a
+     * prefix. A **query string or fragment** is not: {@see self::request()} appends `/api/v1/...`
+     * and then its own `?`, so `https://host?x=1` silently produced
+     * `https://host?x=1/api/v1/credits` — a URL where the entire API path has become part of a
+     * query value. That request does not fail loudly, it goes somewhere else, which is the worst
+     * shape a configuration mistake can take.
      */
     private static function validateBaseUrl(string $baseUrl): string
     {
@@ -483,6 +533,13 @@ final class Transport
                 sprintf('BeaconBox: base_url must include a host, got "%s".', $baseUrl),
             );
         }
+        if (isset($parts['query']) || isset($parts['fragment'])) {
+            throw new \InvalidArgumentException(sprintf(
+                'BeaconBox: base_url must not carry a query string or fragment, got "%s". '
+                . 'A path prefix is fine (https://gateway.example.com/beaconbox).',
+                $baseUrl,
+            ));
+        }
         if ($scheme === 'http' && !\in_array(trim($host, '[]'), self::LOCAL_HOSTS, true)) {
             throw new \InvalidArgumentException(sprintf(
                 'BeaconBox: refusing to send an API key over plain http to "%s". '
@@ -492,6 +549,23 @@ final class Transport
         }
 
         return $cleaned;
+    }
+
+    /**
+     * The `User-Agent`, with the caller's own identifier appended when they gave one.
+     *
+     * Parity with the Python SDK's `user_agent_suffix`, which exists so a merchant can name their
+     * integration and have it visible in a support conversation. Anything that cannot go in a
+     * header value is dropped rather than refused: this is a label for a human to read, so a stray
+     * newline in it must not become a failed constructor, and must not become a forged header
+     * either.
+     */
+    private static function buildUserAgent(?string $suffix): string
+    {
+        $base = 'beaconbox-php/' . Version::VERSION . ' php/' . PHP_VERSION;
+        $cleaned = trim((string) preg_replace('/[^\x20-\x7e]+/', ' ', $suffix ?? ''));
+
+        return $cleaned === '' ? $base : $base . ' ' . $cleaned;
     }
 
     private function sleep(int $milliseconds): void

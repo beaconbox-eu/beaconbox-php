@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace BeaconBox\Tests\Live;
 
 use BeaconBox\BeaconBoxClient;
+use BeaconBox\Enum\ChannelSendStatus;
+use BeaconBox\Enum\EmailSkipReason;
 use BeaconBox\Enum\MessageKind;
 use BeaconBox\Enum\MessageStatus;
 use BeaconBox\Exception\ConflictException;
@@ -74,6 +76,55 @@ final class LiveTest extends TestCase
     private function unique(string $prefix): string
     {
         return $prefix . ' ' . bin2hex(random_bytes(4));
+    }
+
+    /** Phone number for the SMS tests. In the E.164 range reserved for documentation. */
+    private const PHONE = '+37255550134';
+
+    /**
+     * Skip unless there is a balance to spend.
+     *
+     * A zero-balance world refuses every paid send with `insufficient_credit`, which is a correct
+     * answer and a useless fixture: `$delivery->sms` stays null and the SDK's `SmsDelivery` parsing
+     * is exercised by nothing real. Seeding with credits is what makes the send testable, rather
+     * than asserting the refusal and looking like the send was covered.
+     */
+    private function requireCredits(): void
+    {
+        if ($this->client()->credits->balance()->balance < 1) {
+            self::markTestSkipped(
+                'needs a credit balance: seed with `beaconbox e2e seed --credits 200`, '
+                . 'or run `mise run //sdk:live` which does',
+            );
+        }
+    }
+
+    /**
+     * Poll until `$read` returns something, or fail naming what never arrived.
+     *
+     * Delivery is asynchronous: the push returns once the send is *queued* and the worker fills in
+     * the rest. A fixed sleep would be either flaky or slow, and an unlabelled timeout would fail
+     * as "assertNotNull(null)".
+     *
+     * @template T
+     *
+     * @param callable(): (T|null) $read
+     *
+     * @return T
+     */
+    private function eventually(callable $read, string $what, float $seconds = 20.0): mixed
+    {
+        $deadline = microtime(true) + $seconds;
+        while (true) {
+            $value = $read();
+            if ($value !== null) {
+                return $value;
+            }
+            if (microtime(true) >= $deadline) {
+                self::fail(sprintf('%s did not arrive within %gs', $what, $seconds));
+            }
+            usleep(250_000);
+        }
     }
 
     // --- Messages ------------------------------------------------------------------------
@@ -180,6 +231,69 @@ final class LiveTest extends TestCase
         self::assertFalse($this->client()->messages->retract($pushed->id)->retracted);
     }
 
+    public function testAPaidSmsSendReportsItsDelivery(): void
+    {
+        // The paid channel actually sending, which every other test here leaves untouched. Until
+        // the seed could grant credits this path answered `insufficient_credit`, so the SDK's
+        // `SmsDelivery` model was parsed by unit tests only — against payloads this repository
+        // wrote. `accepted` rather than `delivered`: the local carrier is `console`, which logs the
+        // message and never posts a status back, so a send legitimately stops there.
+        $this->requireCredits();
+        $before = $this->client()->credits->balance()->balance;
+
+        $pushed = $this->client()->messages->push(new MessagePush(
+            recipientEmail: self::$recipient,
+            subject: $this->unique('SDK live sms'),
+            body: 'Tracking XY123456789EE.',
+            recipientPhone: self::PHONE,
+            channels: ['sms'],
+        ));
+
+        self::assertNotNull($pushed->sms);
+        self::assertTrue($pushed->sms->queued, 'not queued: ' . ($pushed->sms->skippedReason ?? 'no reason given'));
+        self::assertGreaterThanOrEqual(1, $pushed->sms->credits);
+
+        $delivery = $this->eventually(
+            function () use ($pushed) {
+                $sms = $this->client()->messages->get($pushed->id)->delivery->sms;
+
+                return $sms !== null && $sms->submittedAt !== null ? $sms : null;
+            },
+            'the SMS delivery record',
+        );
+
+        self::assertContains($delivery->status, [ChannelSendStatus::Accepted, ChannelSendStatus::Delivered]);
+        self::assertGreaterThanOrEqual(1, $delivery->creditsCharged);
+        self::assertNotNull($delivery->submittedAt);
+        self::assertNull($delivery->skippedReason);
+        self::assertLessThan(
+            $before,
+            $this->client()->credits->balance()->balance,
+            'a real send spends a real credit',
+        );
+    }
+
+    public function testARetractionReportsWhyNoEmailWasSent(): void
+    {
+        // `$delivery->notSent`, the field that tells `delivered === false` apart from *never
+        // attempted, and never will be*. Retracting before the nudge runs is the cheapest of its
+        // reasons to provoke: the others need a lapsed plan, a daily cap or a suppressed address.
+        $pushed = $this->client()->messages->push(new MessagePush(
+            self::$recipient,
+            $this->unique('SDK live notsent'),
+            'This one gets withdrawn before its nudge runs.',
+        ));
+        self::assertTrue($this->client()->messages->retract($pushed->id)->retracted);
+
+        $notSent = $this->eventually(
+            fn () => $this->client()->messages->get($pushed->id)->delivery->notSent,
+            'the notSent block',
+        );
+
+        self::assertSame(EmailSkipReason::MessageRetracted->value, $notSent->reason);
+        self::assertNotNull($notSent->at);
+    }
+
     public function testAnUnknownIdIsA404(): void
     {
         $this->expectException(ResourceMissingException::class);
@@ -212,11 +326,43 @@ final class LiveTest extends TestCase
         $created = $this->client()->keys->create('sdk-live-' . bin2hex(random_bytes(3)));
         self::assertStringStartsWith('bbx_live_', $created->key);
 
+        self::assertNotSame('', $created->id, 'the create response carries the id to revoke by');
+
         try {
-            $names = array_map(static fn ($k): string => $k->name, $this->client()->keys->list());
-            self::assertContains($created->name, $names);
+            $ids = array_map(static fn ($k): string => $k->id, $this->client()->keys->list());
+            self::assertContains($created->id, $ids);
         } finally {
-            $this->revokeByName($created->name);
+            // Straight by id. This used to look the row up by name, which is ambiguous: a name has
+            // no unique constraint and defaults to "Untitled key", so the match could revoke a
+            // different key than the one just minted.
+            $this->client()->keys->revoke($created->id);
+        }
+    }
+
+    public function testTwoUnnamedKeysAreToldApartById(): void
+    {
+        // The reason `create` returns an id, against the real server. Both keys are "Untitled key",
+        // so anything matching on name cannot say which is which — and this is the path a merchant
+        // takes to revoke a leaked credential.
+        $first = $this->client()->keys->create();
+        $second = $this->client()->keys->create();
+
+        try {
+            self::assertSame($first->name, $second->name);
+            self::assertNotSame($first->id, $second->id);
+
+            $this->client()->keys->revoke($second->id);
+            $remaining = array_map(static fn ($k): string => $k->id, $this->client()->keys->list());
+            self::assertContains($first->id, $remaining);
+            self::assertNotContains($second->id, $remaining);
+        } finally {
+            foreach ([$first, $second] as $key) {
+                try {
+                    $this->client()->keys->revoke($key->id);
+                } catch (ResourceMissingException) {
+                    // already revoked above
+                }
+            }
         }
     }
 
@@ -231,7 +377,7 @@ final class LiveTest extends TestCase
 
             self::assertGreaterThanOrEqual(0, $minted->credits->balance()->threshold);
         } finally {
-            $this->revokeByName($created->name);
+            $this->client()->keys->revoke($created->id);
         }
     }
 
@@ -266,14 +412,4 @@ final class LiveTest extends TestCase
     }
 
     /** Find our row by name: create returns the secret, list returns the id. */
-    private function revokeByName(string $name): void
-    {
-        foreach ($this->client()->keys->list() as $key) {
-            if ($key->name === $name) {
-                $this->client()->keys->revoke($key->id);
-
-                return;
-            }
-        }
-    }
 }

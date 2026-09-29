@@ -404,6 +404,39 @@ final class ResourcesTest extends TestCase
         self::assertStringNotContainsString('bbx_live_secret', print_r($key, true));
     }
 
+    public function testAMintedKeyIsRedactedForJsonEncodeToo(): void
+    {
+        // **The path that actually leaks.** `__debugInfo()` covers `var_dump()` and nothing else,
+        // while a structured logger reaches for `json_encode()`: Monolog's `JsonFormatter`, and
+        // every JSON-lines formatter like it, encodes the context array. Without `jsonSerialize()`
+        // a line as ordinary as `$log->info('key minted', ['key' => $new])` wrote `bbx_live_…` and
+        // the whole of `$raw` into the log stream, where it has to be treated as compromised.
+        [$client] = Fake::client([Fake::json(201, [
+            'name' => 'orders',
+            'key' => 'bbx_live_secret',
+            'masked' => 'bbx_live_••••••••cret',
+            'created' => '2026-08-20T00:00:00Z',
+        ])]);
+
+        $encoded = json_encode($client->keys->create('orders'), JSON_THROW_ON_ERROR);
+
+        self::assertStringNotContainsString('bbx_live_secret', $encoded);
+        self::assertStringContainsString('<redacted>', $encoded);
+        self::assertStringContainsString('masked', $encoded, 'the mask is still useful');
+    }
+
+    public function testASigningSecretIsRedactedForJsonEncodeToo(): void
+    {
+        // The create response is the one moment `$secret` is the real signing secret, and anyone
+        // holding it can forge deliveries to the endpoint it belongs to.
+        [$client] = Fake::client([Fake::json(201, Fake::endpoint())]);
+
+        $encoded = json_encode($client->webhookEndpoints->create('https://example.com/hooks'), JSON_THROW_ON_ERROR);
+
+        self::assertStringNotContainsString('whsec_real_secret', $encoded);
+        self::assertStringContainsString('<redacted>', $encoded);
+    }
+
     public function testKeyRevokeHandlesAnEmptyBody(): void
     {
         [$client, $http] = Fake::client([Fake::json(204)]);
@@ -411,6 +444,22 @@ final class ResourcesTest extends TestCase
         $client->keys->revoke('k_1');
 
         self::assertSame('DELETE', $http->only()->getMethod());
+    }
+
+    public function testAPageSizeBelowOneIsRefused(): void
+    {
+        // The server clamps `limit` into its own range, so this is not an error there — it quietly
+        // becomes one message per request, and a merchant walking a year of history meets that as a
+        // job that takes hours rather than as a mistake in their call.
+        [$client, $http] = Fake::client([Fake::json(200, ['items' => [], 'next_cursor' => null])]);
+
+        $this->expectExceptionMessage('pageSize must be at least 1');
+
+        try {
+            iterator_to_array($client->messages->each(pageSize: 0));
+        } finally {
+            self::assertSame([], $http->requests, 'nothing should reach the network');
+        }
     }
 
     // --- Webhook endpoints ---------------------------------------------------------------

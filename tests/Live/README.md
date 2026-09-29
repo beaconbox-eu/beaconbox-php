@@ -20,7 +20,7 @@ command when you have changed something both SDKs share.
 
 ```bash
 export BEACONBOX_LIVE_URL=https://api.beaconbox.localhost
-export BEACONBOX_API_KEY=$(../scripts/seed.sh | php -r 'echo json_decode(stream_get_contents(STDIN), true)["api_key"];')
+export BEACONBOX_API_KEY=$(../scripts/seed.sh --credits 200 | php -r 'echo json_decode(stream_get_contents(STDIN), true)["api_key"];')
 export BEACONBOX_LIVE_CA_BUNDLE="$(mkcert -CAROOT)/rootCA.pem"
 composer test:live
 ```
@@ -33,6 +33,12 @@ untested here.
 
 `BEACONBOX_LIVE_RECIPIENT` overrides the recipient address, and defaults to
 `live-sdk@example.com`.
+
+**`--credits` is what makes the paid-send test run at all.** A seeded world has a zero balance, so
+every push answers `insufficient_credit`, `$delivery->sms` stays null, and
+`testAPaidSmsSendReportsItsDelivery` skips with a message saying so. `mise run //sdk:live` passes it
+for you. The default stays zero because the Playwright suite asserts the balance it grants to the
+digit — see `api/cli/e2e.py`.
 
 ## What they are for
 

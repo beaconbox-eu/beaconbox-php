@@ -141,10 +141,20 @@ final class Messages extends BaseResource
      *
      * @return \Generator<int, Message>
      *
-     * @throws BeaconBoxException when pagination does not advance
+     * @throws \InvalidArgumentException when `$pageSize` is below 1
+     * @throws BeaconBoxException        when pagination does not advance
      */
     public function each(?string $recipientEmail = null, int $pageSize = 50): \Generator
     {
+        // The server clamps `limit` into its own range, so this is not an error there — it quietly
+        // becomes one message per request, and a merchant walking a year of history meets that as a
+        // job that takes hours rather than as a mistake in their call.
+        if ($pageSize < 1) {
+            throw new \InvalidArgumentException(
+                sprintf('BeaconBox: pageSize must be at least 1, got %d.', $pageSize),
+            );
+        }
+
         $cursor = null;
         $seen = [];
         do {

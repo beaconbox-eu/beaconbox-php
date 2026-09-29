@@ -50,6 +50,8 @@ use Psr\Log\LoggerInterface;
  *                             staging deployment behind a private CA. There is no option to turn
  *                             verification off, because there is no legitimate production reason
  *                             to: bring the right certificate instead.
+ * @param string|null $userAgentSuffix Appended to the `User-Agent`, for identifying your
+ *                             integration in a support conversation.
  * @param LoggerInterface|null $logger Any PSR-3 logger (Monolog, your framework's). Without one
  *                             the SDK logs nothing at all, which is the only acceptable default
  *                             for a library. Requests and responses are `debug`, retries are
@@ -75,6 +77,7 @@ final class BeaconBoxClient
         ?StreamFactoryInterface $streamFactory = null,
         ?string $caBundle = null,
         ?LoggerInterface $logger = null,
+        ?string $userAgentSuffix = null,
     ) {
         $transport = new Transport(
             $apiKey,
@@ -86,6 +89,7 @@ final class BeaconBoxClient
             $streamFactory,
             $caBundle,
             $logger,
+            $userAgentSuffix,
         );
 
         $this->messages = new Messages($transport);

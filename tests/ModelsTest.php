@@ -128,6 +128,62 @@ final class ModelsTest extends TestCase
         self::assertFalse($result->created);
     }
 
+    public function testAnIntegralFloatIsReadAsTheInteger(): void
+    {
+        // JSON has one number type, and `is_int()` alone did not: a proxy or a re-serialising
+        // gateway that writes `1` as `1.0` silently turned one credit into zero, in a field a
+        // merchant is billed on.
+        $outcome = SmsOutcome::fromArray(json_decode('{"queued":true,"credits":1.0}', true));
+
+        self::assertSame(1, $outcome->credits);
+    }
+
+    /** @return list<array{mixed}> */
+    public static function nonIntegers(): array
+    {
+        // `(float) PHP_INT_MAX` is the boundary case: it rounds *up* past PHP_INT_MAX, so an
+        // inclusive bound admitted it, the cast produced PHP_INT_MIN — a negative credit count —
+        // and PHP emitted a warning that `failOnWarning="true"` would surface elsewhere.
+        return [[1.5], [NAN], [INF], [-INF], [(float) PHP_INT_MAX], [(float) PHP_INT_MIN], ['3'], [null], [true], [[]]];
+    }
+
+    #[DataProvider('nonIntegers')]
+    public function testAnythingElseIsTheDefaultRatherThanACoercion(mixed $value): void
+    {
+        // A truncated `1.5` would be a different kind of silent wrongness, so it is not coerced.
+        self::assertSame(0, SmsOutcome::fromArray(['queued' => true, 'credits' => $value])->credits);
+    }
+
+    public function testATimestampWithNoOffsetIsReadAsUtc(): void
+    {
+        // Without an explicit zone PHP applies `date.timezone`, so the same response parsed as two
+        // different instants on two hosts, hours apart, with nothing to indicate it. The API sends
+        // UTC, so UTC is what a value with no offset means.
+        $previous = date_default_timezone_get();
+        date_default_timezone_set('America/Sao_Paulo');
+
+        try {
+            $outcome = SmsOutcome::fromArray([
+                'queued' => true, 'credits' => 1, 'escalates_at' => '2026-01-01T10:00:00',
+            ]);
+
+            self::assertNotNull($outcome->escalatesAt);
+            self::assertSame('2026-01-01T10:00:00+00:00', $outcome->escalatesAt->format('c'));
+        } finally {
+            date_default_timezone_set($previous);
+        }
+    }
+
+    public function testAnExplicitOffsetStillWins(): void
+    {
+        $outcome = SmsOutcome::fromArray([
+            'queued' => true, 'credits' => 1, 'escalates_at' => '2026-01-01T10:00:00+03:00',
+        ]);
+
+        self::assertNotNull($outcome->escalatesAt);
+        self::assertSame('2026-01-01T10:00:00+03:00', $outcome->escalatesAt->format('c'));
+    }
+
     // --- Outcomes ------------------------------------------------------------------------
 
     public function testASkipCarriesItsReason(): void
