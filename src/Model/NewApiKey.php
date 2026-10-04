@@ -19,12 +19,10 @@ namespace BeaconBox\Model;
 final class NewApiKey implements \JsonSerializable
 {
     /**
-     * @param string $id Pass this to {@see \BeaconBox\Resource\Keys::revoke()}. Without it the only
-     *                   route to the id was to list the keys and match on `$name` — and a name
-     *                   carries no unique constraint and defaults to "Untitled key", so two unnamed
-     *                   keys are indistinguishable and the match resolves to whichever the ordering
-     *                   happens to put first. That is a wrong-key revocation on the one path that
-     *                   exists to answer a leak.
+     * @param string $id The handle for revoking this key: pass it to
+     *                   {@see \BeaconBox\Resource\Keys::revoke()}. Use it rather than matching on
+     *                   `$name`, which carries no unique constraint and defaults to "Untitled key",
+     *                   so two unnamed keys cannot be told apart.
      * @param array<string, mixed> $raw
      */
     public function __construct(

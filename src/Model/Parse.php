@@ -53,29 +53,52 @@ final class Parse
     /**
      * An integer field, or `$default` when the API sent something else.
      *
-     * An integral `float` counts, because JSON has one number type and `is_int()` alone did not:
-     * a proxy, a language boundary or a re-serialising gateway that writes `1` as `1.0` turned one
-     * credit into zero here, silently, in a field a merchant is billed on. A non-integral float is
-     * not coerced — a truncated `1.5` would be a different kind of silent wrongness.
+     * An integral `float` counts, because JSON has one number type: a proxy, a language boundary
+     * or a re-serialising gateway that writes `1` as `1.0` must not silently report zero credits
+     * in a field a merchant is billed on. A non-integral float is not coerced, since a truncated
+     * `1.5` is its own kind of silent wrongness.
      *
      * @param array<string, mixed> $payload
      */
     public static function int(array $payload, string $key, int $default = 0): int
     {
-        $value = $payload[$key] ?? null;
+        return self::coerceInt($payload[$key] ?? null) ?? $default;
+    }
+
+    /**
+     * Like {@see int()}, but absent/null/unusable reads back as null rather than as a number.
+     *
+     * For fields where zero is a real value and "we could not reach it at all" is a different
+     * one — `WebhookTestResult::$statusCode` is both: `0` would read as an HTTP status.
+     *
+     * @param array<string, mixed> $payload
+     */
+    public static function nullableInt(array $payload, string $key): ?int
+    {
+        return self::coerceInt($payload[$key] ?? null);
+    }
+
+    /**
+     * The one definition of "is this a usable integer", shared by both accessors above so the
+     * reasoning below has one home rather than two copies that can drift.
+     */
+    private static function coerceInt(mixed $value): ?int
+    {
         if (\is_int($value)) {
             return $value;
         }
+        // NaN and infinity are excluded before the range test rather than by it: both compare
+        // false against every bound, and `(int)` on either is undefined rather than merely wrong.
+        //
         // Strict `<` on the upper bound, not `<=`. `(float) PHP_INT_MAX` rounds *up* to
-        // 9223372036854775808.0, so `<=` admitted a float one larger than any int — which casts to
-        // PHP_INT_MIN, a *negative* credit count, and emits a warning that `failOnWarning="true"`
-        // would surface as an unrelated test failure.
+        // 9223372036854775808.0, so `<=` would admit a float one larger than any int, which casts
+        // to PHP_INT_MIN: a negative credit count from a positive number.
         if (\is_float($value) && !is_nan($value) && !is_infinite($value) && $value === floor($value)
             && $value > (float) PHP_INT_MIN && $value < (float) PHP_INT_MAX) {
             return (int) $value;
         }
 
-        return $default;
+        return null;
     }
 
     /** @param array<string, mixed> $payload */
@@ -166,13 +189,12 @@ final class Parse
         }
 
         try {
-            // **UTC, not `date.timezone`.** Without the second argument PHP reads a timestamp that
-            // carries no offset in the *server's* configured zone, so `2026-01-01T10:00:00` became
-            // 10:00 in Sao Paulo on one host and 10:00 in Tallinn on the next — the same response
-            // parsed as two different instants, five hours apart, with nothing to indicate it. The
-            // API sends UTC, so UTC is what a value with no offset means. A value that does carry
-            // one is unaffected: an explicit offset in the string wins over this argument, which is
-            // exactly the behaviour wanted, and matches the Python SDK's `_parse_datetime`.
+            // **UTC, not `date.timezone`.** Without the second argument PHP reads a timestamp
+            // carrying no offset in the *server's* configured zone, so `2026-01-01T10:00:00` would
+            // be 10:00 in Sao Paulo on one host and 10:00 in Tallinn on the next: the same response
+            // parsed as two different instants, with nothing to indicate it. The API sends UTC, so
+            // UTC is what a value with no offset means. A value that does carry an offset is
+            // unaffected, since an explicit offset in the string wins over this argument.
             return new \DateTimeImmutable($value, self::utc());
         } catch (\Exception) {
             return null;

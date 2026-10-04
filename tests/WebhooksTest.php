@@ -80,6 +80,19 @@ final class WebhooksTest extends TestCase
         self::assertSame('parcel.collected', $event->type);
     }
 
+    public function testAnUppercaseHexSignatureStillVerifies(): void
+    {
+        // Hex is hex. `hash_hmac` returns it lowercase and `hash_equals` compares bytes, so
+        // without normalising the incoming value a sender that spelled the same digest in
+        // uppercase would be refused: a false negative on a signature that is correct.
+        $header = strtoupper($this->sign());
+        $header = str_replace(['T=', 'V1='], ['t=', 'v1='], $header);
+
+        $event = Webhooks::verify(self::BODY, $header, self::SECRET, now: self::NOW);
+
+        self::assertSame('evt_1', $event->id);
+    }
+
     public function testExtraSignaturePairsAreTolerated(): void
     {
         // So that a future `v2=` scheme does not make every deployed verifier reject the delivery
@@ -140,6 +153,16 @@ final class WebhooksTest extends TestCase
             ['t=' . self::NOW],
             ['t=notanumber,v1=abc'],
             ['t=0,v1=abc'],
+            // Spellings a looser integer parse would accept. The timestamp is inside the signed
+            // string, so it has exactly one canonical form and every alternative is a second way
+            // to write the same header.
+            ['t=+' . self::NOW . ',v1=abc'],
+            ['t= ' . self::NOW . ' ,v1=abc'],
+            ['t=1_700_000_000,v1=abc'],
+            // Twenty-one digits and up. `ctype_digit` alone accepted any length and left `(int)`
+            // to saturate at PHP_INT_MAX, so an absurd value became a silently plausible one.
+            ['t=' . str_repeat('9', 21) . ',v1=abc'],
+            ['t=' . str_repeat('9', 5000) . ',v1=abc'],
         ];
     }
 
@@ -148,6 +171,16 @@ final class WebhooksTest extends TestCase
     {
         $this->expectException(WebhookVerificationException::class);
         Webhooks::verify(self::BODY, $header, self::SECRET, now: self::NOW);
+    }
+
+    public function testTheLongestTimestampItAcceptsIsStillHandled(): void
+    {
+        // The boundary: twenty digits parses, and is then simply far outside tolerance. Asserted so
+        // nobody tightens the bound below a real Unix timestamp.
+        $this->expectException(WebhookVerificationException::class);
+        $this->expectExceptionMessageMatches('/seconds off/');
+
+        Webhooks::verify(self::BODY, 't=' . str_repeat('9', 20) . ',v1=abc', self::SECRET, now: self::NOW);
     }
 
     public function testABodyThatIsNotJson(): void
@@ -215,5 +248,53 @@ final class WebhooksTest extends TestCase
 
         self::assertStringContainsString('hash_equals(', $source);
         self::assertStringNotContainsString('=== $signature', $source);
+    }
+
+    /**
+     * **The error a merchant actually hits, and the one most likely to be misread.**
+     *
+     * "Signature does not match" sounds like a key problem. The overwhelmingly common cause is
+     * not: the bytes being checked are not the bytes that were sent, because something between
+     * the wire and the check decoded and re-encoded the JSON. Found by using our own product — a
+     * body copied out of a webhook inspector's "copy as curl" failed exactly this way, and the
+     * first instinct was to go looking at the secret.
+     *
+     * Reproduced from its real cause rather than from a corrupted byte: the re-encoded body is
+     * semantically identical and still cannot verify, which is why it confuses people.
+     */
+    public function testAReEncodedBodyIsWhatFails(): void
+    {
+        $reEncoded = json_encode(json_decode(self::BODY, true), JSON_PRETTY_PRINT);
+        self::assertIsString($reEncoded);
+        self::assertSame(
+            json_decode(self::BODY, true),
+            json_decode($reEncoded, true),
+            'must differ only in formatting',
+        );
+
+        try {
+            Webhooks::verify($reEncoded, $this->sign(), self::SECRET, now: self::NOW);
+            self::fail('a re-encoded body must not verify');
+        } catch (WebhookVerificationException $e) {
+            self::assertStringContainsString('raw request bytes', $e->getMessage());
+        }
+    }
+
+    /**
+     * Ordering is the point: somebody who reads "check your secret" first rotates a working
+     * secret before thinking about the body.
+     */
+    public function testTheMessageNamesTheLikelyCauseBeforeTheSecret(): void
+    {
+        try {
+            Webhooks::verify('{"tampered":true}', $this->sign(), self::SECRET, now: self::NOW);
+            self::fail('a tampered body must not verify');
+        } catch (WebhookVerificationException $e) {
+            $message = $e->getMessage();
+            self::assertLessThan(
+                strpos($message, 'secret'),
+                strpos($message, 'raw request bytes'),
+            );
+        }
     }
 }

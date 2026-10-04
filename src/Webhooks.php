@@ -89,15 +89,30 @@ final class Webhooks
         }
 
         $expected = hash_hmac('sha256', $timestamp . '.' . $rawBody, $secret);
-        if (!hash_equals($expected, $signature)) {
-            throw new WebhookVerificationException('BeaconBox: webhook signature does not match.');
+        // `strtolower` on the incoming value, because `hash_hmac` returns lowercase hex while
+        // `hash_equals` compares bytes: without it the same signature spelled in uppercase hex
+        // would be refused. Hex case carries no meaning, so normalising it rejects nothing real,
+        // and the comparison itself stays constant-time.
+        if (!hash_equals($expected, strtolower($signature))) {
+            // Names the likely cause, because the obvious reading of this error is the wrong one.
+            // "Signature does not match" sounds like a key problem, and the overwhelmingly common
+            // cause is not: it is that the bytes checked are not the bytes sent. Any
+            // parse-and-re-serialize — a framework handing over decoded JSON, a logging proxy, a
+            // copy out of a webhook inspector — reorders keys or re-spaces the JSON and changes
+            // the digest completely, while leaving a body that still looks identical to read.
+            throw new WebhookVerificationException(
+                'BeaconBox: webhook signature does not match. The most common cause is verifying '
+                . 'against a re-serialized body rather than the raw request bytes — if you decoded '
+                . 'the JSON first, or copied the body out of a tool that pretty-prints it, verify '
+                . 'the original bytes instead. Failing that, check the secret belongs to this '
+                . 'endpoint.',
+            );
         }
 
         $decoded = json_decode($rawBody, true);
         // A JSON *array* decodes to a PHP array too, so `is_array` alone would wave `[1,2,3]`
         // through to `fromArray` and hand the caller an event with every field null rather than an
-        // exception. Only reachable from a body that already passed the HMAC above — so this is
-        // parity with the Python SDK's `isinstance(document, dict)` rather than a live hole.
+        // exception. Only reachable from a body that already passed the HMAC above.
         //
         // The `!== []` is load-bearing: `json_decode('{}', true)` also gives `[]`, and
         // `array_is_list([])` is true, so without it a legitimately empty object would be refused.
@@ -130,7 +145,14 @@ final class Webhooks
         }
 
         $raw = $parts['t'] ?? '';
-        $timestamp = ctype_digit($raw) ? (int) $raw : 0;
+        // Between one and twenty digits. `ctype_digit` alone accepted a megabyte of them and left
+        // `(int)` to saturate silently at PHP_INT_MAX, and twenty digits is already far past any
+        // Unix timestamp.
+        //
+        // `\z`, not `$`: PCRE's `$` also matches *before* a trailing newline, so `123\n` would
+        // pass. `trim()` above happens to remove one today, which makes the pattern's correctness
+        // depend on that rather than state it. In a signature path the pattern carries the rule.
+        $timestamp = preg_match('/^[0-9]{1,20}\z/', $raw) === 1 ? (int) $raw : 0;
         $signature = $parts['v1'] ?? '';
 
         if ($timestamp <= 0 || $signature === '') {

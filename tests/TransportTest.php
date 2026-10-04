@@ -300,16 +300,18 @@ final class TransportTest extends TestCase
     /** @return list<array{string}> */
     public static function absurdRetryAfterValues(): array
     {
-        return [['99999999999999999999'], [str_repeat('9', 40)]];
+        // Twenty digits is the longest the grammar accepts, and it is also where the arithmetic
+        // below stops fitting: anything past it is in `unusableRetryAfterValues` instead.
+        return [['99999999999999999999'], [str_repeat('9', 19)], ['9999999999999999.5']];
     }
 
     #[DataProvider('absurdRetryAfterValues')]
     public function testAnAbsurdRetryAfterIsCappedRatherThanOverflowed(string $value): void
     {
         // `((int) $seconds) * 1000` overflows to a float, and the parser declares `?int` under
-        // `strict_types`, so a broken or hostile header turned a 429 into a TypeError thrown from
-        // inside the retry loop. The caller still gets a rate-limit error with "absurdly long" on
-        // it, and the policy still refuses to sit through it.
+        // `strict_types`, so a broken or hostile header would otherwise turn a 429 into a TypeError
+        // thrown from inside the retry loop. The caller still gets a rate-limit error with an
+        // absurdly long wait on it, and the policy still refuses to sit through it.
         [$client] = Fake::client([Fake::json(429, [], ['Retry-After' => $value])]);
 
         try {
@@ -326,7 +328,16 @@ final class TransportTest extends TestCase
     {
         // The HTTP-date form is legal and essentially never used by an API; parsing it would mean
         // trusting the caller's clock to agree with the server's.
-        return [['Wed, 21 Oct 2026 07:28:00 GMT'], ['-5'], ['soon'], [''], ['1e3'], ['0x10']];
+        //
+        // The last two are past the grammar's length bound rather than the wrong shape, and they
+        // land here deliberately: a wait of 10^20 seconds is not an instruction a server means to
+        // give, so it is read as a broken header and answered with this SDK's own backoff. The
+        // other BeaconBox clients draw the line in the same place, so one 429 cannot produce a
+        // server-directed wait in one language and an invented one in another.
+        return [
+            ['Wed, 21 Oct 2026 07:28:00 GMT'], ['-5'], ['soon'], [''], ['1e3'], ['0x10'],
+            [str_repeat('9', 21)], [str_repeat('9', 40)],
+        ];
     }
 
     #[DataProvider('unusableRetryAfterValues')]

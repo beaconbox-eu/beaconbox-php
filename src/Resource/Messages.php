@@ -74,8 +74,8 @@ final class Messages extends BaseResource
      * not fail the batch, because a batch that aborted at item 7 would leave items 8 onwards
      * unsent with nothing to say which.
      *
-     * Safe to retry: each item carries its own key derived from the batch's, so a retry after a
-     * crash replays the items that already landed instead of pushing them again.
+     * **Safe to retry with the same key.** Items that already went out are replayed rather than
+     * sent a second time, including after a crash partway through the batch.
      *
      * @param list<MessagePush|array<string, mixed>> $messages
      */

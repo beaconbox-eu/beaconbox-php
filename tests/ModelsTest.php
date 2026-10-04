@@ -16,6 +16,7 @@ use BeaconBox\Model\MessagePush;
 use BeaconBox\Model\MessagePushResult;
 use BeaconBox\Model\SmsOutcome;
 use BeaconBox\Model\WebhookEvent;
+use BeaconBox\Model\WebhookTestResult;
 use BeaconBox\Tests\Support\Fake;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
@@ -130,9 +131,8 @@ final class ModelsTest extends TestCase
 
     public function testAnIntegralFloatIsReadAsTheInteger(): void
     {
-        // JSON has one number type, and `is_int()` alone did not: a proxy or a re-serialising
-        // gateway that writes `1` as `1.0` silently turned one credit into zero, in a field a
-        // merchant is billed on.
+        // JSON has one number type, so a proxy or a re-serialising gateway may write `1` as `1.0`.
+        // Refusing it would report zero credits in a field a merchant is billed on.
         $outcome = SmsOutcome::fromArray(json_decode('{"queued":true,"credits":1.0}', true));
 
         self::assertSame(1, $outcome->credits);
@@ -142,8 +142,8 @@ final class ModelsTest extends TestCase
     public static function nonIntegers(): array
     {
         // `(float) PHP_INT_MAX` is the boundary case: it rounds *up* past PHP_INT_MAX, so an
-        // inclusive bound admitted it, the cast produced PHP_INT_MIN — a negative credit count —
-        // and PHP emitted a warning that `failOnWarning="true"` would surface elsewhere.
+        // inclusive bound would admit it and the cast would produce PHP_INT_MIN, turning a
+        // positive number into a negative credit count.
         return [[1.5], [NAN], [INF], [-INF], [(float) PHP_INT_MAX], [(float) PHP_INT_MIN], ['3'], [null], [true], [[]]];
     }
 
@@ -152,6 +152,29 @@ final class ModelsTest extends TestCase
     {
         // A truncated `1.5` would be a different kind of silent wrongness, so it is not coerced.
         self::assertSame(0, SmsOutcome::fromArray(['queued' => true, 'credits' => $value])->credits);
+    }
+
+    #[DataProvider('nonIntegers')]
+    public function testANullableIntReadsTheSameShapesAsAbsent(mixed $value): void
+    {
+        // `WebhookTestResult::$statusCode` is the field where `0` would read as an HTTP status, so
+        // it is nullable rather than defaulted. It still goes through the one integer coercion, so
+        // the shapes refused above are refused here as null rather than as a plausible status.
+        $result = WebhookTestResult::fromArray(['delivered' => false, 'status_code' => $value]);
+
+        self::assertNull($result->statusCode);
+    }
+
+    public function testAStatusTheEndpointAnsweredIsKept(): void
+    {
+        $result = WebhookTestResult::fromArray(['delivered' => false, 'status_code' => 503]);
+
+        self::assertSame(503, $result->statusCode);
+    }
+
+    public function testAnAbsentStatusIsNullRatherThanZero(): void
+    {
+        self::assertNull(WebhookTestResult::fromArray(['delivered' => false])->statusCode);
     }
 
     public function testATimestampWithNoOffsetIsReadAsUtc(): void

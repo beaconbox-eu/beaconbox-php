@@ -493,6 +493,96 @@ final class ResourcesTest extends TestCase
         self::assertSame('orders', $http->body()['description']);
     }
 
+    public function testPushParsesThePerChannelEmailBlock(): void
+    {
+        // Its own block precisely so a bounce suppression never surfaces as an SMS reason, nor an
+        // SMS STOP as an email one.
+        [$client] = Fake::client([Fake::json(201, [
+            ...Fake::pushResult(),
+            'email' => ['sending' => false, 'skipped_reason' => 'suppressed'],
+        ])]);
+
+        $result = $client->messages->push(new MessagePush(recipientEmail: 'a@b.c', subject: 's', body: 'b'));
+
+        self::assertNotNull($result->email);
+        self::assertFalse($result->email->sending);
+        self::assertSame('suppressed', $result->email->skippedReason);
+    }
+
+    public function testPushEmailBlockIsNullWhenNothingWasNudged(): void
+    {
+        [$client] = Fake::client([Fake::json(201, [...Fake::pushResult(), 'email' => null])]);
+
+        $result = $client->messages->push(new MessagePush(recipientEmail: 'a@b.c', subject: 's', body: 'b'));
+
+        self::assertNull($result->email);
+    }
+
+    public function testPushEmailBlockSurvivesAnUnknownReason(): void
+    {
+        // The vocabulary grows server-side; an unknown reason must arrive intact rather than
+        // being dropped, so a merchant can treat it as "not sent" as the API documents.
+        [$client] = Fake::client([Fake::json(201, [
+            ...Fake::pushResult(),
+            'email' => ['sending' => false, 'skipped_reason' => 'invented_later'],
+        ])]);
+
+        $result = $client->messages->push(new MessagePush(recipientEmail: 'a@b.c', subject: 's', body: 'b'));
+
+        self::assertNotNull($result->email);
+        self::assertSame('invented_later', $result->email->skippedReason);
+    }
+
+    public function testEndpointTestReportsAWorkingEndpoint(): void
+    {
+        [$client, $http] = Fake::client([Fake::json(200, [
+            'delivered' => true, 'status_code' => 200, 'error' => null, 'duration_ms' => 42,
+        ])]);
+
+        $result = $client->webhookEndpoints->test('we_1');
+
+        self::assertSame('POST', $http->only()->getMethod());
+        self::assertStringEndsWith(
+            '/webhook-endpoints/we_1/test',
+            $http->only()->getUri()->getPath(),
+        );
+        self::assertTrue($result->delivered);
+        self::assertSame(200, $result->statusCode);
+        self::assertSame(42, $result->durationMs);
+    }
+
+    public function testEndpointTestDoesNotThrowWhenTheReceiverIsBroken(): void
+    {
+        // The failure is at the caller's own server, so throwing would describe the wrong hop —
+        // and a merchant debugging their handler would be fighting an exception instead of
+        // reading a status code.
+        [$client] = Fake::client([Fake::json(200, [
+            'delivered' => false,
+            'status_code' => 500,
+            'error' => 'The endpoint answered HTTP 500.',
+            'duration_ms' => 17,
+        ])]);
+
+        $result = $client->webhookEndpoints->test('we_1');
+
+        self::assertFalse($result->delivered);
+        self::assertSame(500, $result->statusCode);
+        self::assertStringContainsString('500', (string) $result->error);
+    }
+
+    public function testEndpointTestDistinguishesUnreachableFromAZeroStatus(): void
+    {
+        // Why `statusCode` is nullable rather than defaulting to 0: `0` would read as an HTTP
+        // status, and "never answered" is a different fact from any status it could have sent.
+        [$client] = Fake::client([Fake::json(200, [
+            'delivered' => false, 'status_code' => null, 'error' => 'no route', 'duration_ms' => 0,
+        ])]);
+
+        $result = $client->webhookEndpoints->test('we_1');
+
+        self::assertNull($result->statusCode);
+    }
+
     public function testEndpointListSurfacesADisabledEndpoint(): void
     {
         // A silent endpoint looks exactly like nothing having happened.

@@ -7,9 +7,9 @@ namespace BeaconBox\Model;
 /**
  * Present when BeaconBox decided not to email a message at all, and that decision still stands.
  *
- * **The field that makes `delivered === false` readable.** Without it that flag meant two opposite
- * things — *on its way* and *never attempted, and never will be* — so a caller polling for
- * delivery had no way to stop waiting. Null is the ordinary case.
+ * **The field that makes `delivered === false` readable.** On its own that flag covers two opposite
+ * situations, *on its way* and *never attempted, and never will be*; this is what tells them apart,
+ * so a caller polling for delivery knows when to stop. Null is the ordinary case.
  *
  * `$reason` is a plain string rather than an enum, unlike `SmsDelivery::$skippedReason`'s
  * companion `SkipReason`. The server's list grows whenever a refusal is added to the send path,

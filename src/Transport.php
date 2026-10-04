@@ -440,16 +440,15 @@ final class Transport
      * used by an API, and parsing it would mean trusting the caller's clock to agree with the
      * server's, which is the assumption that makes it worse than our own backoff.
      *
-     * **A fractional value counts**, which `ctype_digit` alone refused. The README promises the two
-     * SDKs back off identically down to the constants, and the Python one reads `Retry-After: 1.5`
-     * as 1.5 seconds; refusing it here meant the same 429 from the same server produced a
-     * server-directed wait in one language and an invented backoff in the other.
+     * **A fractional value counts.** A server answering `Retry-After: 1.5` has said something more
+     * precise than `2`, and rounding it up is this SDK inventing a wait the server did not ask for.
      *
      * **The result is capped rather than multiplied blindly.** `(int) $seconds * 1000` overflows to
      * a `float` for an absurd header value, and this method declares `?int` under `strict_types`,
-     * so a broken or hostile `Retry-After: 99999999999999999999` turned a 429 into a `TypeError`
-     * thrown from inside the retry loop. The cap is far beyond any `maxRetryAfterMs`, so the policy
-     * still refuses to wait it out and the caller still sees "absurdly long" on the exception.
+     * so a broken or hostile `Retry-After: 99999999999999999999` would otherwise raise a
+     * `TypeError` from inside the retry loop. The cap sits far beyond any `maxRetryAfterMs`, so the
+     * policy still refuses to wait it out and the caller still sees "absurdly long" on the
+     * exception.
      *
      * @param array<string, string> $headers
      */
@@ -460,7 +459,11 @@ final class Transport
                 continue;
             }
             $trimmed = trim($value);
-            if (preg_match('/^\d+(\.\d+)?$/', $trimmed) !== 1) {
+            // The integer part is bounded because that is the half that can overflow the
+            // arithmetic below; the fraction is not, since no number of digits after the point can,
+            // and a limit there could only reject a precise value a server legitimately sent.
+            // `\z` rather than `$`, which in PCRE also matches before a trailing newline.
+            if (preg_match('/^[0-9]{1,20}(\.[0-9]+)?\z/', $trimmed) !== 1) {
                 return null;
             }
             $seconds = (float) $trimmed;
@@ -554,7 +557,7 @@ final class Transport
     /**
      * The `User-Agent`, with the caller's own identifier appended when they gave one.
      *
-     * Parity with the Python SDK's `user_agent_suffix`, which exists so a merchant can name their
+     * A label for identifying an integration in a support conversation, so a merchant can name their
      * integration and have it visible in a support conversation. Anything that cannot go in a
      * header value is dropped rather than refused: this is a label for a human to read, so a stray
      * newline in it must not become a failed constructor, and must not become a forged header

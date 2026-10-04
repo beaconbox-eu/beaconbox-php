@@ -1,65 +1,47 @@
 # Live tests (PHP)
 
-These run the SDK against a **real** BeaconBox. They are skipped unless `BEACONBOX_LIVE_URL` and
-`BEACONBOX_API_KEY` are set, so `composer test` stays hermetic and fast. They are also in their own
-PHPUnit suite, so the default run never collects them.
+These run the SDK against a **real** BeaconBox. They are a separate PHPUnit suite, so
+`composer test` stays hermetic and fast.
 
 ## Running them
 
-From `sdk/`:
-
 ```bash
-mise run //deployment/local:up   # once, if the stack is not already running
-mise run //sdk:live-php          # seeds a fresh business and runs this suite
-```
-
-`mise run //sdk:live` runs this suite and the Python one against the **same** seed, which is the better
-command when you have changed something both SDKs share.
-
-## Running them by hand
-
-```bash
-export BEACONBOX_LIVE_URL=https://api.beaconbox.localhost
-export BEACONBOX_API_KEY=$(../scripts/seed.sh --credits 200 | php -r 'echo json_decode(stream_get_contents(STDIN), true)["api_key"];')
-export BEACONBOX_LIVE_CA_BUNDLE="$(mkcert -CAROOT)/rootCA.pem"
+export BEACONBOX_LIVE_URL=https://api.beaconbox.eu
+export BEACONBOX_API_KEY=bbx_live_...
 composer test:live
 ```
 
-`BEACONBOX_LIVE_CA_BUNDLE` is needed against the local stack and not against a public deployment,
-because curl will not trust the mkcert certificate the local stack serves. Passing it exercises the
-same `caBundle:` option a merchant behind a TLS-inspecting corporate proxy needs, which is why the
-suite does that rather than turning verification off and leaving the SDK's security default
-untested here.
+| Variable | What it does |
+| --- | --- |
+| `BEACONBOX_LIVE_URL` | The BeaconBox to test against. Required; absent means skip. |
+| `BEACONBOX_API_KEY` | A key for a **throwaway** business. Required; absent means skip. |
+| `BEACONBOX_LIVE_RECIPIENT` | Recipient address. Defaults to `live-sdk@example.com`. |
+| `BEACONBOX_LIVE_CA_BUNDLE` | A CA bundle, for a target serving a privately issued certificate. |
 
-`BEACONBOX_LIVE_RECIPIENT` overrides the recipient address, and defaults to
-`live-sdk@example.com`.
+`BEACONBOX_LIVE_CA_BUNDLE` is passed straight to the client's `caBundle:`, which exercises the same
+option a merchant behind a TLS-inspecting corporate proxy needs. The suite takes a bundle rather
+than turning verification off, so the SDK's security default is never the thing under test.
 
-**`--credits` is what makes the paid-send test run at all.** A seeded world has a zero balance, so
-every push answers `insufficient_credit`, `$delivery->sms` stays null, and
-`testAPaidSmsSendReportsItsDelivery` skips with a message saying so. `mise run //sdk:live` passes it
-for you. The default stays zero because the Playwright suite asserts the balance it grants to the
-digit — see `api/cli/e2e.py`.
+**The account needs a positive credit balance for the paid-send test to run.** On a zero balance
+every push answers `insufficient_credit`, `$delivery->sms` stays null, and the paid-send test skips
+with a message saying so.
 
 ## What they are for
 
 Every hermetic test asserts against a payload this repository wrote. If the SDK and the API
 disagree about a field name, both sides of a unit test agree with each other and are wrong
-together. That is not hypothetical here: `pushBatch` shipped sending `{"messages": [...]}` at an
-API that reads `{"items": [...]}`. Unit tests green, every real call a 422.
+together: the suite passes and every real call fails. These tests are what close that gap.
 
 So the assertions here are deliberately shallow. What matters is that the server accepted the
-request and the SDK understood the answer. The exceptions are the three behaviours no mock can
-prove:
-
-- an `Updateable` push with a repeated subject updates in place instead of creating a second
-  message;
-- two pushes under one idempotency key are one message in the real store;
-- a key minted through `keys->create()` actually authenticates.
+request and the SDK understood the answer. The exceptions are the behaviours no mock can prove:
+that an `Updateable` push with a repeated subject updates in place, that two pushes under one
+idempotency key are one message in the real store, and that a key minted through `keys->create()`
+actually authenticates.
 
 ## Notes
 
-- **They write.** Each run pushes real messages and mints and revokes real keys against a
-  throwaway seeded business. Do not point them at production.
+- **They write.** Each run pushes real messages and mints and revokes real keys. Point them at a
+  throwaway business, never at production.
 - Subjects are uniquified per run, because an `Updateable` push matches on subject and a reused one
   would update the previous run's message.
 - Keys and webhook endpoints created here are cleaned up in `finally` blocks.

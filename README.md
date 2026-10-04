@@ -8,9 +8,12 @@ composer require beaconbox/beaconbox-php
 ```
 
 PHP 8.1+. The only runtime dependencies are `ext-curl`, `ext-json` and three PSR interface
-packages — `psr/http-client`, `psr/http-factory` and `psr/log` — which ship interfaces and no
+packages (`psr/http-client`, `psr/http-factory` and `psr/log`), which ship interfaces and no
 implementation. No HTTP stack is pulled into the host application: a library that drags one in is
 a library that eventually conflicts with it.
+
+Full documentation, including the API reference and the guides this README summarises, is at
+[docs.beaconbox.eu](https://docs.beaconbox.eu/develop).
 
 ## Push an update
 
@@ -70,16 +73,65 @@ if ($result->sms?->skippedReason === SkipReason::InsufficientCredit->value) {
 **This SDK does not throw on a skip**, deliberately. Treating one as an error is what invites a
 retry, and a retry of a push that already succeeded is a second message to a real person.
 
+The **email** side answers in two halves, because the decision is made twice.
+
+`$result->email` is the verdict as known at push time, so the stable, recipient-shaped reasons
+reach you in the response to the call you just made:
+
+```php
+if ($result->email !== null && !$result->email->sending) {
+    // Reliable: no email will be sent, and skippedReason says why.
+    error_log($result->email->skippedReason);  // plan_lapsed, unsubscribed, suppressed, ...
+}
+```
+
+**`sending === false` is reliable; `sending === true` is an expectation, not a promise.** At push
+time we can see a suppressed address or a lapsed plan; we cannot see the day's cap filling up
+between now and the send, or a pause applied in between. So for what actually happened, read the
+message back:
+
+```php
+use BeaconBox\Enum\EmailSkipReason;
+
+$message = $client->messages->get($result->id);
+
+if ($message->delivery->notSent !== null) {
+    // No email was ever attempted, and none will be. Stop polling for delivery.
+    if ($message->delivery->notSent->reason === EmailSkipReason::PlanLapsed->value) {
+        // the subscription ran out; paying resumes sending
+    }
+}
+```
+
+`notSent` is what tells `delivery->delivered === false` apart from itself. On its own that flag
+covers both *on its way* and *never attempted*, which leaves a loop waiting for delivery nothing
+to stop on. It is `null` in the ordinary case, and a later successful send withdraws it.
+
+Compare `reason` as a string and treat an unrecognised value as "not sent": the server's list
+grows whenever a refusal is added to the send path, which is why this field is not typed as the
+enum.
+
 ### 2. Idempotency is handled for you, and you can do better
 
-Every write carries an `Idempotency-Key`. This SDK generates one per call and **reuses it across
+Every `POST` carries an `Idempotency-Key`. This SDK generates one per call and **reuses it across
 its own retries**, so a connection that dies with the answer in flight cannot become a duplicate
 email and a duplicate charged SMS.
+
+`PUT` and `DELETE` do not carry one and do not need one: setting a recipient's number twice leaves
+one number. Sending a message twice sends two messages and charges two credits, which is the whole
+reason the header is mandatory on a push.
 
 Pass your own whenever you have a natural key:
 
 ```php
-$client->messages->push($message, idempotencyKey: 'order-4711-shipped');
+$client->messages->push(
+    new MessagePush(
+        recipientEmail: 'buyer@example.com',
+        subject: 'Your order has shipped',
+        body: 'Tracking XY123456789EE.',
+    ),
+    idempotencyKey: 'order-4711-shipped',
+);
 ```
 
 Then a retry from *anywhere*, your queue, a cron, a human clicking twice, collapses onto the same
@@ -99,7 +151,10 @@ foreach ($client->messages->each(recipientEmail: 'buyer@example.com') as $messag
 $client->messages->retract('3xg39cvt8a46');
 
 // Up to 100 pushes. Always 200: read ->failed, not the status code
-$result = $client->messages->pushBatch([$one, $two]);
+$result = $client->messages->pushBatch([
+    new MessagePush(recipientEmail: 'a@example.com', subject: 'Shipped', body: 'Tracking XY123456789EE.'),
+    new MessagePush(recipientEmail: 'b@example.com', subject: 'Shipped', body: 'Tracking XY987654321EE.'),
+]);
 foreach ($result->failures() as $item) {
     error_log("item {$item->index} rejected: {$item->errorCode}");
 }
@@ -113,7 +168,14 @@ $client->credits->balance()->balance;
 
 // Keys and webhook endpoints
 $client->keys->create('orders service');
-$client->webhookEndpoints->create('https://example.com/hooks');  // empty list means every event
+$endpoint = $client->webhookEndpoints->create('https://example.com/hooks');  // empty = every event
+
+// Send one sample ping and see what came back. Always 200, whatever your endpoint answers:
+// the failure being reported belongs to the next hop, so read ->delivered, not the status.
+$test = $client->webhookEndpoints->test($endpoint->id);
+if (!$test->delivered) {
+    error_log("{$test->statusCode} {$test->error} {$test->durationMs}ms");
+}
 ```
 
 ### Pay only for the customers the email did not reach
@@ -194,11 +256,14 @@ message text. `$exception->requestId` is what support will ask for.
 ## Configuration
 
 ```php
+use BeaconBox\BeaconBoxClient;
+use BeaconBox\RetryPolicy;
+
 $client = new BeaconBoxClient(
     apiKey: getenv('BEACONBOX_API_KEY'),
     baseUrl: 'https://api.beaconbox.eu',
     timeoutMs: 30_000,
-    retryPolicy: new BeaconBox\RetryPolicy(maxRetries: 2),
+    retryPolicy: new RetryPolicy(maxRetries: 2),
     userAgentSuffix: 'acme-shop/2.1',
 );
 ```
@@ -218,7 +283,7 @@ being absorbed is synchronised across every worker you run.
 
 **A `Retry-After` is honoured in full, not shortened to the backoff cap.** It is the server's own
 answer to when it will be ready, and retrying earlier only earns a second 429. Jitter is added *on
-top* of it rather than sampled from within it — the herd is at its worst here, because every worker
+top* of it rather than sampled from within it, because the herd is at its worst here: every worker
 that hit the same 429 was handed the same number.
 
 If the server asks for longer than `RetryPolicy::$maxRetryAfterMs` (30s by default), the SDK
@@ -261,14 +326,14 @@ remembered to hide and the field added next year is not on it.
   redirect points.
 - `CURLOPT_SSL_VERIFYPEER` and `VERIFYHOST` are set explicitly, so a php.ini or a system curl
   config that has turned them off cannot silently disable certificate verification.
-- **An API key that cannot go in a header is refused at construction** — a control character, a
+- **An API key that cannot go in a header is refused at construction**: a control character, a
   newline or a non-ASCII character. curl does not sanitise what it is handed, so a `\r\n` inside
   the key would be request smuggling with your own credential as the payload. Surrounding
   whitespace is trimmed, because a key read from a file keeps its trailing newline.
 - **A `baseUrl` with a query string or a fragment is refused**, because it would not fail, it would
   go somewhere else. A path prefix is fine, for a gateway that mounts BeaconBox under one.
 - The API key is redacted from `var_dump`, and so are `NewApiKey::$key` and a webhook endpoint's
-  secret — from `json_encode` too, which is the path a structured logger actually takes. Note that
+  secret, from `json_encode` too, which is the path a structured logger actually takes. Note that
   `var_export`, `serialize` and `->raw` accept no hook and still carry the value: read the property,
   store it, drop the object.
 - Webhook signatures are compared with `hash_equals`, over a signed timestamp.

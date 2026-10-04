@@ -7,6 +7,7 @@ namespace BeaconBox\Resource;
 use BeaconBox\Enum\WebhookEventType;
 use BeaconBox\Model\Parse;
 use BeaconBox\Model\WebhookEndpoint;
+use BeaconBox\Model\WebhookTestResult;
 
 /**
  * Where BeaconBox pushes delivery outcomes.
@@ -62,6 +63,31 @@ final class WebhookEndpoints extends BaseResource
             ],
             idempotencyKey: $idempotencyKey,
         ));
+    }
+
+    /**
+     * Send one sample `ping` event to this endpoint and report what came back.
+     *
+     * **The only way to find out your handler works before a real event depends on it.** A wrong
+     * webhook fails silently by nature: your handler is simply never called, and nothing on
+     * either side says so.
+     *
+     * The event type is `ping`, deliberately not a real one — a test carrying `message.delivered`
+     * would be indistinguishable from the genuine article at your end. It is signed exactly like
+     * a real delivery, so it also proves your signature verification.
+     *
+     * Never throws for a failure at *your* end: read `->delivered`. Testing does not affect the
+     * endpoint's health counters, so press it as often as you like while fixing a handler.
+     */
+    public function test(string $publicId): WebhookTestResult
+    {
+        $payload = $this->transport->request(
+            'POST',
+            '/webhook-endpoints/' . rawurlencode($publicId) . '/test',
+            route: '/webhook-endpoints/{id}/test',
+        );
+
+        return WebhookTestResult::fromArray($payload);
     }
 
     /**

@@ -25,6 +25,10 @@ final class MessagePushResult
      *                                           arrive later, by webhook.
      * @param \DateTimeImmutable|null $scheduledFor When a deferred nudge will be sent, if
      *                                           `sendAt` held it back.
+     * @param EmailOutcome|null    $email        Present when an email nudge was queued. Null
+     *                                           when none was — `notify: false`, or an update
+     *                                           that does not re-nudge — because there is then
+     *                                           no email outcome to report.
      * @param SmsOutcome|null      $sms          Present when SMS was in play, queued or
      *                                           explicitly refused. Null when the account has SMS
      *                                           off and this push did not ask for it.
@@ -46,6 +50,7 @@ final class MessagePushResult
         public readonly \DateTimeImmutable $createdAt,
         public readonly \DateTimeImmutable $updatedAt,
         public readonly ?\DateTimeImmutable $scheduledFor = null,
+        public readonly ?EmailOutcome $email = null,
         public readonly ?SmsOutcome $sms = null,
         public readonly int $smsUnits = 0,
         public readonly ?WhatsAppOutcome $whatsapp = null,
@@ -73,6 +78,9 @@ final class MessagePushResult
             Parse::datetime($payload, 'created_at'),
             Parse::datetime($payload, 'updated_at'),
             Parse::nullableDatetime($payload, 'scheduled_for'),
+            isset($payload['email']) && \is_array($payload['email'])
+                ? EmailOutcome::fromArray($payload['email'])
+                : null,
             isset($payload['sms']) && \is_array($payload['sms'])
                 ? SmsOutcome::fromArray($payload['sms'])
                 : null,
