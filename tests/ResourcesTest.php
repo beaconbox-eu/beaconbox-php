@@ -6,14 +6,17 @@ namespace BeaconBox\Tests;
 
 use BeaconBox\Enum\Channel;
 use BeaconBox\Enum\MessageKind;
+use BeaconBox\Enum\OrderStatus;
 use BeaconBox\Enum\RecipientStatus;
 use BeaconBox\Enum\SkipReason;
+use BeaconBox\Enum\SmsConsentSource;
 use BeaconBox\Enum\WebhookEventType;
 use BeaconBox\Exception\BeaconBoxException;
 use BeaconBox\Exception\ConflictException;
 use BeaconBox\Exception\ResourceMissingException;
 use BeaconBox\Model\Message;
 use BeaconBox\Model\MessagePush;
+use BeaconBox\RetryPolicy;
 use BeaconBox\Tests\Support\Fake;
 use PHPUnit\Framework\TestCase;
 
@@ -97,6 +100,22 @@ final class ResourcesTest extends TestCase
         self::assertSame(['sms', 'whatsapp'], $http->body()['channels']);
     }
 
+    public function testPushSendsTheOrderStatusAsItsValue(): void
+    {
+        [$client, $http] = Fake::client([Fake::json(201, [...Fake::pushResult(), 'order_status' => 'shipped'])]);
+
+        $result = $client->messages->push(new MessagePush(
+            'a@b.c',
+            's',
+            'b',
+            reference: '#A-10294',
+            orderStatus: OrderStatus::Shipped,
+        ));
+
+        self::assertSame('shipped', $http->body()['order_status']);
+        self::assertSame(OrderStatus::Shipped, $result->orderStatus);
+    }
+
     public function testWhatsAppOptInBecomesTheObjectTheApiRequires(): void
     {
         // The API refuses a bare boolean on purpose: a copied `true` is not evidence of anything,
@@ -120,6 +139,24 @@ final class ResourcesTest extends TestCase
         self::assertSame(SkipReason::InsufficientCredit->value, $result->sms->skippedReason);
     }
 
+    /** `channels: [Channel::Sms]` on an account with SMS off, or not yet enabled, is still a 201. */
+    public function testNamingAChannelCannotSwitchItOn(): void
+    {
+        foreach ([SkipReason::SmsDisabled, SkipReason::SmsNotEnabled] as $reason) {
+            [$client, $http] = Fake::client([Fake::json(201, [
+                ...Fake::pushResult(),
+                'sms' => ['queued' => false, 'credits' => 0, 'skipped_reason' => $reason->value],
+            ])]);
+
+            $result = $client->messages->push(new MessagePush('a@b.c', 's', 'b', channels: [Channel::Sms]));
+
+            self::assertSame(['sms'], $http->body()['channels']);
+            self::assertNotNull($result->sms);
+            self::assertFalse($result->sms->queued);
+            self::assertSame($reason, SkipReason::tryFrom((string) $result->sms->skippedReason));
+        }
+    }
+
     // --- Batch ---------------------------------------------------------------------------
 
     public function testBatchSendsTheListUnderItems(): void
@@ -132,6 +169,19 @@ final class ResourcesTest extends TestCase
 
         self::assertSame(['items'], array_keys($http->body()));
         self::assertSame('a@b.c', $http->body()['items'][0]['recipient_email']);
+    }
+
+    public function testABatchItemSendsItsOrderStatus(): void
+    {
+        [$client, $http] = Fake::client([Fake::json(200, ['items' => [], 'succeeded' => 0, 'failed' => 0])]);
+
+        $client->messages->pushBatch([
+            new MessagePush('a@b.c', 's', 'b', orderStatus: OrderStatus::Delivered),
+            new MessagePush('d@e.f', 's', 'b'),
+        ]);
+
+        self::assertSame('delivered', $http->body()['items'][0]['order_status']);
+        self::assertArrayNotHasKey('order_status', $http->body()['items'][1]);
     }
 
     public function testBatchReportsFailuresAsData(): void
@@ -163,6 +213,28 @@ final class ResourcesTest extends TestCase
         [$client, $http] = Fake::client([Fake::json(200, ['items' => [], 'succeeded' => 0, 'failed' => 0])]);
 
         $client->messages->pushBatch([], 'nightly-2026-08-20');
+
+        self::assertSame('nightly-2026-08-20', $http->only()->getHeaderLine('Idempotency-Key'));
+    }
+
+    public function testABatchStillRunningUnderTheKeyThrowsAndIsNotRetried(): void
+    {
+        // The whole batch's 409, never an item's result. Retrying it inside the SDK would only hit
+        // the same live run, so it is the caller's to retry later with the same key.
+        [$client, $http] = Fake::client([
+            Fake::json(409, ['error_code' => 'idempotency.request_in_progress']),
+            Fake::json(200, ['items' => [], 'succeeded' => 0, 'failed' => 0]),
+        ], new RetryPolicy(maxRetries: 3, baseDelayMs: 0, maxDelayMs: 0));
+
+        try {
+            $client->messages->pushBatch(
+                [new MessagePush(recipientEmail: 'a@b.c', subject: 's', body: 'b')],
+                'nightly-2026-08-20',
+            );
+            self::fail('expected ConflictException');
+        } catch (ConflictException $thrown) {
+            self::assertSame('idempotency.request_in_progress', $thrown->errorCode);
+        }
 
         self::assertSame('nightly-2026-08-20', $http->only()->getHeaderLine('Idempotency-Key'));
     }
@@ -242,6 +314,23 @@ final class ResourcesTest extends TestCase
 
         $this->expectException(ConflictException::class);
         $client->messages->resendSms('m_8sKq2Vd1');
+    }
+
+    public function testAResendWhileASendIsStillQueuedIsAConflictWithARequestId(): void
+    {
+        [$client] = Fake::client([Fake::json(
+            409,
+            ['error_code' => 'sms.already_sent', 'detail' => 'already queued'],
+            ['X-Request-Id' => 'abc123'],
+        )]);
+
+        try {
+            $client->messages->resendSms('m_8sKq2Vd1');
+            self::fail('expected ConflictException');
+        } catch (ConflictException $thrown) {
+            self::assertSame('sms.already_sent', $thrown->errorCode);
+            self::assertSame('abc123', $thrown->getRequestId());
+        }
     }
 
     public function testResendWhatsApp(): void
@@ -327,6 +416,29 @@ final class ResourcesTest extends TestCase
         self::assertStringEndsWith('/recipients/buyer%40example.com/sms', (string) $http->only()->getUri());
         self::assertSame('+372 •••• 0134', $recipient->phone);
         self::assertSame(RecipientStatus::Active, $recipient->smsStatus);
+        self::assertNull($recipient->smsConsentAt);
+        self::assertNull($recipient->smsConsentSource);
+    }
+
+    public function testRecipientReadCarriesWhenAndWhereConsentBegan(): void
+    {
+        [$client] = Fake::client([Fake::json(200, [
+            ...self::recipient(),
+            'sms_consent_at' => '2026-08-01T12:00:00Z',
+            'sms_consent_source' => 'api',
+        ])]);
+
+        $recipient = $client->recipients->sms('buyer@example.com');
+
+        self::assertSame('2026-08-01T12:00:00+00:00', $recipient->smsConsentAt?->format(DATE_ATOM));
+        self::assertSame(SmsConsentSource::Api, $recipient->smsConsentSource);
+    }
+
+    public function testAnUnknownConsentSourceFallsBackToTheString(): void
+    {
+        [$client] = Fake::client([Fake::json(200, [...self::recipient(), 'sms_consent_source' => 'kiosk'])]);
+
+        self::assertSame('kiosk', $client->recipients->sms('buyer@example.com')->smsConsentSource);
     }
 
     public function testSetPhone(): void
@@ -370,6 +482,98 @@ final class ResourcesTest extends TestCase
         self::assertSame(3, $receipt->repliesAForwardEmailMayHaveCarried);
     }
 
+    public function testErasePostsWithAKeyAndReturnsTheReport(): void
+    {
+        [$client, $http] = Fake::client([Fake::json(200, [
+            'messages_deleted' => 2,
+            'message_events_deleted' => 5,
+            'channel_sends_deleted' => 1,
+            'message_links_deleted' => 2,
+            'whatsapp_replies_deleted' => 0,
+            'webhook_payloads_scrubbed' => 1,
+            'queued_jobs_cancelled' => 0,
+            'idempotency_records_deleted' => 2,
+            'audit_entries_pseudonymised' => 1,
+            'subscription_deleted' => true,
+            'stops_kept' => 1,
+            'suppressions_kept' => 0,
+            'auto_reply_windows_dropped' => 0,
+            'replies_a_forward_email_may_have_carried' => 0,
+        ])]);
+
+        $report = $client->recipients->erase('buyer+tag@example.com');
+
+        self::assertSame('POST', $http->only()->getMethod());
+        self::assertStringEndsWith('/recipients/buyer%2Btag%40example.com/erase', (string) $http->only()->getUri());
+        self::assertNotSame('', $http->only()->getHeaderLine('Idempotency-Key'));
+        self::assertSame(2, $report->messagesDeleted);
+        self::assertSame(1, $report->stopsKept);
+        self::assertTrue($report->subscriptionDeleted);
+    }
+
+    public function testEraseForwardsACallerKey(): void
+    {
+        // Retrying with the same key is how a timed-out erasure gets its original counts back.
+        [$client, $http] = Fake::client([Fake::json(200, [])]);
+
+        $client->recipients->erase('buyer@example.com', 'erase-buyer-1');
+
+        self::assertSame('erase-buyer-1', $http->only()->getHeaderLine('Idempotency-Key'));
+    }
+
+    public function testEraseCannotBeSteeredToAnotherRoute(): void
+    {
+        [$client, $http] = Fake::client([Fake::json(200, [])]);
+
+        $client->recipients->erase('a/../../keys@example.com');
+
+        self::assertStringEndsWith(
+            '/recipients/a%2F..%2F..%2Fkeys%40example.com/erase',
+            (string) $http->only()->getUri(),
+        );
+    }
+
+    /** @return list<array{string, string}> */
+    public static function valuesThatAreNotAnAddress(): array
+    {
+        $cases = [];
+        foreach (['erase', 'eraseWhatsApp'] as $method) {
+            foreach (['', '   ', 'buyer', '@example.com', 'buyer@', 'buyer@localhost', 'a b@example.com'] as $email) {
+                $cases[] = [$method, $email];
+            }
+        }
+
+        return $cases;
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('valuesThatAreNotAnAddress')]
+    public function testEraseRefusesAValueThatIsNotAnAddress(string $method, string $email): void
+    {
+        // The API answers 422 for these anyway. An erasure is the call where a slip should fail at
+        // the caller's line, before anything is sent.
+        [$client, $http] = Fake::client([Fake::json(200, [])]);
+
+        try {
+            $client->recipients->{$method}($email);
+            self::fail('expected InvalidArgumentException');
+        } catch (\InvalidArgumentException $thrown) {
+            self::assertStringContainsString('email address', $thrown->getMessage());
+            if (trim($email) !== '') {
+                self::assertStringNotContainsString($email, $thrown->getMessage());
+            }
+        }
+        self::assertSame([], $http->requests);
+    }
+
+    public function testEraseTrimsSurroundingWhitespace(): void
+    {
+        [$client, $http] = Fake::client([Fake::json(200, [])]);
+
+        $client->recipients->erase(" buyer@example.com\n");
+
+        self::assertStringEndsWith('/recipients/buyer%40example.com/erase', (string) $http->only()->getUri());
+    }
+
     // --- Keys ----------------------------------------------------------------------------
 
     public function testKeysListUnwrapsItems(): void
@@ -385,6 +589,22 @@ final class ResourcesTest extends TestCase
 
         self::assertCount(1, $keys);
         self::assertSame('k_1', $keys[0]->id);
+        self::assertNull($keys[0]->mintedBy);
+    }
+
+    public function testKeysListCarriesTheMintingKey(): void
+    {
+        [$client] = Fake::client([Fake::json(200, ['items' => [[
+            'id' => 'k_2',
+            'name' => 'planted',
+            'masked' => 'bbx_live_••••••••abcd',
+            'created' => '2026-08-01T00:00:00Z',
+            'minted_by' => 'k_1',
+        ]]])]);
+
+        $keys = $client->keys->list();
+
+        self::assertSame('k_1', $keys[0]->mintedBy);
     }
 
     public function testKeyCreate(): void
@@ -402,6 +622,20 @@ final class ResourcesTest extends TestCase
         self::assertSame('bbx_live_secret', $key->key);
         // Readable when asked for, redacted when dumped.
         self::assertStringNotContainsString('bbx_live_secret', print_r($key, true));
+    }
+
+    public function testDetachIsSentOnlyWhenAskedFor(): void
+    {
+        [$client, $http] = Fake::client([Fake::json(201, [
+            'name' => 'rotation',
+            'key' => 'bbx_live_new',
+            'masked' => 'bbx_live_••••••••_new',
+            'created' => '2026-10-07T00:00:00Z',
+        ])]);
+
+        $client->keys->create('rotation', detach: true);
+
+        self::assertSame(['name' => 'rotation', 'detach' => true], $http->body());
     }
 
     public function testAMintedKeyIsRedactedForJsonEncodeToo(): void

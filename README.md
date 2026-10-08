@@ -20,6 +20,7 @@ Full documentation, including the API reference and the guides this README summa
 ```php
 use BeaconBox\BeaconBoxClient;
 use BeaconBox\Enum\MessageKind;
+use BeaconBox\Enum\OrderStatus;
 use BeaconBox\Model\MessagePush;
 
 $client = new BeaconBoxClient(getenv('BEACONBOX_API_KEY'));
@@ -29,6 +30,8 @@ $result = $client->messages->push(new MessagePush(
     subject: 'Your order has shipped',
     body: 'Tracking XY123456789EE. Estimated delivery Thursday.',
     kind: MessageKind::Updateable,
+    reference: '#A-10294',
+    orderStatus: OrderStatus::Shipped,
 ));
 
 echo $result->id;  // 3xg39cvt8a46
@@ -43,7 +46,15 @@ them. Anything the API adds that this SDK does not know about yet is still reada
 
 Re-push the same `subject` with `MessageKind::Updateable` to overwrite it in place, quietly. Add
 `notify: true` to force a nudge on an update, or `obsoletes: [...]` to grey out messages this one
-replaces.
+replaces (at most 100 ids, each at most 64 characters).
+
+Pass `reference:` (your order number) and `orderStatus:` (an `OrderStatus` such as
+`OrderStatus::Shipped`, or its string value) and BeaconBox writes the WhatsApp and SMS wording for
+you, for example "Your order #A-10294 from PhonicBloom has shipped." A WhatsApp nudge needs both:
+missing either, WhatsApp is skipped with `template_not_sendable` and nothing is charged.
+
+A request body may be at most 2 MiB, or 8 MiB for a batch. A larger one is refused with
+`InvalidRequestException` (HTTP 413, `request.too_large`) before it is read.
 
 ## Two things to know before anything else
 
@@ -61,17 +72,41 @@ $result = $client->messages->push(new MessagePush(
     recipientEmail: 'buyer@example.com',
     subject: 'Your order has shipped',
     body: 'Tracking XY123456789EE.',
+    reference: '#A-10294',
     recipientPhone: '+37255550134',
     channels: [Channel::Sms],
+    orderStatus: OrderStatus::Shipped,
 ));
 
 if ($result->sms?->skippedReason === SkipReason::InsufficientCredit->value) {
     // Top up, then: $client->messages->resendSms($result->id);
+} elseif (\in_array($result->sms?->skippedReason, [
+    SkipReason::SmsDisabled->value,    // your SMS mode is off
+    SkipReason::SmsNotEnabled->value,  // BeaconBox has not switched SMS on for you yet
+], true)) {
+    // The email went. Naming Channel::Sms above did not, and cannot, turn SMS on.
 }
 ```
 
 **This SDK does not throw on a skip**, deliberately. Treating one as an error is what invites a
 retry, and a retry of a push that already succeeded is a second message to a real person.
+
+#### What `channels` means
+
+`channels` is a request that can only **narrow** what your account settings allow. It never
+switches a channel on:
+
+- Leave it null and the push follows your account settings.
+- Leave a channel out of the list and this push does not use it (`disabled_by_request`).
+- Name a channel whose mode is `off` and nothing is sent on it (`sms_disabled`,
+  `whatsapp_disabled`). `off` is final.
+- Name a channel BeaconBox has not yet enabled for your business and nothing is sent on it
+  (`sms_not_enabled`, `whatsapp_not_enabled`). Ask for it from the dashboard.
+- A channel in `on_request` mode sends only on a push that names it.
+
+Naming a channel never overrides a country restriction or a recipient who opted out, and on
+WhatsApp never a recipient who did not opt in. A push that does not mention a channel your account
+has off, or sends only on request, gets no block for it at all (`$result->sms === null`).
 
 The **email** side answers in two halves, because the decision is made twice.
 
@@ -101,11 +136,26 @@ if ($message->delivery->notSent !== null) {
         // the subscription ran out; paying resumes sending
     }
 }
+
+if ($message->delivery->failed !== null) {
+    // An email was attempted and BeaconBox gave up: esp_refused, retries_exhausted
+    // or outcome_unknown (the answer was lost; it may still arrive, which clears `failed`,
+    // and is never resent).
+    error_log($message->delivery->failed->reason);
+}
 ```
 
 `notSent` is what tells `delivery->delivered === false` apart from itself. On its own that flag
 covers both *on its way* and *never attempted*, which leaves a loop waiting for delivery nothing
 to stop on. It is `null` in the ordinary case, and a later successful send withdraws it.
+`failed` is its counterpart at the other end of the send path: the email was tried, and the
+provider refused it, every retry failed, or (`outcome_unknown`) the provider's answer was lost,
+in which case it may still arrive: a later delivery clears `failed` (back to `null`) and shows as
+delivered, whatever its timestamp. Either one means stop waiting, unless an `outcome_unknown`
+delivery still matters to you.
+
+`daily_cap_reached` needs a resend: the nudge is not retried when the cap resets, so push again
+the next day if the update still matters.
 
 Compare `reason` as a string and treat an unrecognised value as "not sent": the server's list
 grows whenever a refusal is added to the send path, which is why this field is not typed as the
@@ -137,6 +187,10 @@ $client->messages->push(
 Then a retry from *anywhere*, your queue, a cron, a human clicking twice, collapses onto the same
 key rather than only the retries this SDK makes internally.
 
+A key is at most 255 characters, and a **batch** key at most 252: each item's own key is the
+batch key with `#<index>` appended. A longer one is refused with `InvalidRequestException` before
+anything runs.
+
 ## Everything else
 
 ```php
@@ -150,7 +204,9 @@ foreach ($client->messages->each(recipientEmail: 'buyer@example.com') as $messag
 // Take one back: withdrawn for the recipient, any queued nudge called off, no credit spent
 $client->messages->retract('3xg39cvt8a46');
 
-// Up to 100 pushes. Always 200: read ->failed, not the status code
+// Up to 100 pushes. Read ->failed, not the status code. A ConflictException
+// (idempotency.request_in_progress) means the same batch is still running: retry it with the same key
+// later. The SDK does not retry it for you, and items already sent are replayed rather than resent
 $result = $client->messages->pushBatch([
     new MessagePush(recipientEmail: 'a@example.com', subject: 'Shipped', body: 'Tracking XY123456789EE.'),
     new MessagePush(recipientEmail: 'b@example.com', subject: 'Shipped', body: 'Tracking XY987654321EE.'),
@@ -160,6 +216,7 @@ foreach ($result->failures() as $item) {
 }
 
 // Contact details. Reads are masked: a leaked key must not dump a phone book
+$client->recipients->sms('buyer@example.com')->smsConsentSource;  // push, api, admin or inbox
 $client->recipients->setPhone('buyer@example.com', '+37255550134');
 $client->recipients->clearPhone('buyer@example.com');
 
@@ -184,6 +241,16 @@ if (!$test->delivered) {
 still has not opened the message after that long, and if they open it first, nothing is sent and
 nothing is charged.
 
+- **The minutes count from the email**: from `sendAt` when the message is scheduled, otherwise
+  from the push. If the email is still queued at the deadline, the deadline moves to that many
+  minutes after it goes.
+- **An email that bounced, failed or was skipped counts as unread**, so the paid channel is still
+  sent, subject to its own consent and settings. That is the case the paid channel exists for: the
+  email did not reach them. Only a push that queued no nudge at all (`notify: false`, or a quiet
+  in-place update) never escalates.
+- A channel in `on_request` mode that the push named still sends at the deadline.
+- `$result->sms->escalatesAt` (or `$result->whatsapp->escalatesAt`) says when the deadline falls.
+
 ```php
 $client->messages->push(new MessagePush(
     recipientEmail: 'buyer@example.com',
@@ -195,9 +262,32 @@ $client->messages->push(new MessagePush(
 ));
 ```
 
-### Erasing a recipient's WhatsApp history
+### Erasing a recipient
+
+`$client->recipients->erase($email)` is the API half of an Article 17 request made to you, and it
+is **not undoable**. It deletes the messages you sent them, their delivery events, their SMS and
+WhatsApp send records, their WhatsApp replies and their recipient record (phone number, consent,
+unsubscribe state), scrubs them from webhook deliveries still queued for you, and cancels sends
+still waiting to go out.
+
+It **keeps** email suppressions for the address (an unsubscribe is kept as one) and SMS or WhatsApp
+opt-outs for their number, on purpose: those are what stop them being contacted again by a later
+push, and an opt-out erased on request stops being one. Erasing does not undo an unsubscribe: a
+later push to the address finds them still unsubscribed. The report counts both. A repeat erasure,
+or one of an address you never messaged, answers with zeros; retry a timed-out call with the same
+idempotency key to get the original counts back.
+
+`$client->recipients->eraseWhatsApp($email)` removes only their WhatsApp history and withdraws
+WhatsApp consent.
+
+Both take the recipient's email address and nothing else. A blank value, or one that is not an
+address, throws `\InvalidArgumentException` before anything is sent (the API refuses it with a 422
+anyway), so a slip in the value fails at your line.
 
 ```php
+$report = $client->recipients->erase('buyer@example.com');
+error_log("{$report->messagesDeleted} {$report->suppressionsKept} {$report->stopsKept}");
+
 $receipt = $client->recipients->eraseWhatsApp('buyer@example.com');
 
 // The half only you can finish: erased replies whose words may already be in *your* mailboxes.
@@ -234,6 +324,13 @@ a captured delivery cannot be replayed) and compares in constant time.
 
 Deliveries are **retried**, so the same `$event->id` can arrive twice. Deduplicate on it.
 
+| Event | `$event->data` |
+| --- | --- |
+| `message.delivered`, `message.opened`, `message.bounced`, `message.complained` | `message_id`, `recipient_email`, `subject`, `channel` (`"email"`) |
+| `message.not_sent` | the same, plus `reason` (an `EmailSkipReason` value): no email was attempted |
+| `message.failed` | the same, plus `reason` (`esp_refused`, `retries_exhausted` or `outcome_unknown`) when BeaconBox gave up on the send: an email was attempted and will not be retried. `outcome_unknown` means the provider's answer was lost, so it may still arrive: a `message.delivered` for the message supersedes it, in whichever order the two arrive |
+| `sms.delivered`, `sms.failed`, `sms.rejected`, and the same three for `whatsapp.*` | `message_id`, `recipient_phone` (masked), `country_code`, `credits_charged`, `channel`, `error_code`. Sent on the carrier's (or Meta's) report, and also when BeaconBox ends the send itself: refused at submit (`rejected`), an outcome never learned (`failed`, `*.submit_outcome_unknown`), or a send given up on after its retries (`failed`) |
+
 ## Errors
 
 Everything extends `BeaconBox\Exception\BeaconBoxException`.
@@ -241,17 +338,43 @@ Everything extends `BeaconBox\Exception\BeaconBoxException`.
 | Exception | When |
 | --- | --- |
 | `AuthenticationException` | 401, key missing, malformed or revoked |
-| `PermissionException` | 403 |
-| `InvalidRequestException` | 422, a malformed field, or a reused idempotency key with a different body |
+| `PermissionException` | 403, for example `plan.read_only` |
+| `InvalidRequestException` | 422, a malformed field, or a reused idempotency key with a different body. Also 413, a body over the size limit |
 | `ResourceMissingException` | 404, no such id. Also what another business's id looks like, deliberately |
-| `ConflictException` | 409, already sent, or an identical request still in flight |
+| `ConflictException` | 409, already sent, still queued, or an identical request still in flight |
 | `RateLimitException` | 429, after the SDK has already retried |
 | `ServerException` | 5xx, after the SDK has already retried |
 | `ApiConnectionException` | no answer at all. **Not** proof the work did not happen |
 | `WebhookVerificationException` | a delivery could not be proven to be ours |
 
 Branch on `$exception->errorCode` (a stable dotted string such as `message.not_found`), not on the
-message text. `$exception->requestId` is what support will ask for.
+message text. Some worth knowing:
+
+| `errorCode` | Status | Means |
+| --- | --- | --- |
+| `sms.already_sent`, `whatsapp.already_sent` | 409 | a resend while that channel's send is still queued, or after it went |
+| `whatsapp.escalated_to_sms` | 409 | a WhatsApp resend after `smsIfWhatsAppFails` already texted them |
+| `sms.may_have_sent` | 409 | an SMS resend after an earlier text ended without the carrier's answer |
+| `whatsapp.may_have_sent` | 409 | a WhatsApp resend after an earlier message ended without Meta's answer |
+| `sms.phone_already_in_use` | 409 | the number belongs to another of your recipients |
+| `idempotency.request_in_progress` | 409 | the same key is still running; wait and retry with it |
+| `request.conflict` | 409 | two requests raced to write the same thing; a retry sees the winner |
+| `webhook.test_rate_limited` | 429 | `webhookEndpoints->test()` pressed too often |
+| `common.validation_failed` | 422 | a field is malformed or over a limit, for example more than 100 `obsoletes` |
+| `sms.phone_invalid` | 422 | `recipientPhone` or `recipients->setPhone()` got a number that does not parse or cannot be a recipient's phone: premium-rate, toll-free, shared-cost, voicemail, service, or a satellite or international code (+800, 808, 870, 878, 881, 882, 883, 888, 979). A number in those ranges stored earlier is skipped as `country_not_allowed` |
+| `request.too_large` | 413 | the body is over 2 MiB (8 MiB for a batch); refused before it is read |
+| `request.unstorable_input` | 422 | text holds a NUL character or a lone surrogate, which cannot be stored; the idempotency key is not spent |
+| `plan.read_only` | 403 | `keys->create()` while your plan has lapsed; pay, and it works again |
+
+A paid send that fails after the push reports its own code on the `sms.failed` or `whatsapp.failed`
+webhook as `$event->data['error_code']`. `sms.submit_outcome_unknown` and
+`whatsapp.submit_outcome_unknown` mean BeaconBox called the carrier (or Meta) and never learned the
+answer: the message may have arrived, so no second copy is sent and the charge stands. A WhatsApp
+one still falls back to SMS when `smsIfWhatsAppFails` was set.
+
+**Every response carries an `X-Request-Id`.** It is on every `ApiException` as
+`$exception->getRequestId()` (also the `$requestId` property) and in its message. Quote it to
+support: it is the one value that finds your request in our logs.
 
 ## Configuration
 
@@ -310,7 +433,8 @@ $client = new BeaconBoxClient(
 | `warning` | a retry (with reason and backoff), and giving up after the last one |
 
 Nothing is emitted at `info` or above, so a `warning` from this SDK always means something went
-wrong. Each record carries context (`route`, `attempt`, `status_code`, `idempotency_key`).
+wrong. Each record carries context (`route`, `attempt`, `status_code`, `idempotency_key`,
+`request_id`). `request_id` is the response's `X-Request-Id`, the value to quote to support.
 
 **Nothing sensitive is ever logged.** Not the API key or any header, not request or response
 bodies, not the query string, and not the interpolated URL path. A route template is logged

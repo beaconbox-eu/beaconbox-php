@@ -183,6 +183,32 @@ final class LoggingTest extends TestCase
         self::assertStringContainsString('HTTP 503', $warnings[0]);
     }
 
+    public function testTheResponseLogCarriesTheRequestId(): void
+    {
+        // The value support asks for, on the line an operator will be reading.
+        [$client, $logger] = $this->clientWithLogger([
+            Fake::json(201, Fake::pushResult(), ['X-Request-Id' => '9f1c2e']),
+        ]);
+
+        $client->messages->push($this->push());
+
+        $context = $logger->contextAt(LogLevel::DEBUG)[1];
+        self::assertSame('9f1c2e', $context['request_id']);
+    }
+
+    public function testTheRetryLogCarriesTheRequestIdOfTheAnswerItRetried(): void
+    {
+        [$client, $logger] = $this->clientWithLogger(
+            [Fake::json(503, [], ['X-Request-Id' => 'first']), Fake::json(201, Fake::pushResult())],
+            new RetryPolicy(maxRetries: 1, baseDelayMs: 0, maxDelayMs: 0),
+        );
+
+        $client->messages->push($this->push());
+
+        $context = $logger->contextAt(LogLevel::WARNING)[0];
+        self::assertSame('first', $context['request_id']);
+    }
+
     public function testTheRetryLogNamesTheKeyItReused(): void
     {
         // So an operator reading the logs can see the retry reused the key. A retry that minted a

@@ -9,8 +9,11 @@ final class WhatsAppOutcome
 {
     /**
      * @param bool $smsFallback Whether an SMS is armed to follow if this WhatsApp message proves
-     *                          undeliverable. If it fires it is a separate send with its own
-     *                          credit: poll the message to see it.
+     *                          undeliverable, or queued at once because WhatsApp cannot carry
+     *                          it (`not_reachable`, or `template_not_sendable` because the push
+     *                          lacks `reference` or `order_status`, or the reference or
+     *                          business name cannot be shown). Either way it is a separate
+     *                          send with its own credit: poll the message to see it.
      * @param array<string, mixed> $raw
      */
     public function __construct(

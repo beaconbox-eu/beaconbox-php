@@ -10,9 +10,11 @@ namespace BeaconBox\Model;
  * `$opened` is the one worth acting on: it is the difference between "we sent it" and "they have
  * it", and it is what `escalateIfUnreadAfterMinutes` waits on.
  *
- * `$notSent` is the one worth checking *before* you wait for any of them. A non-null value means
- * no email was ever attempted and none will be, so polling `$delivered` for this message will
- * never terminate. See {@see NotSent}.
+ * `$notSent` and `$failed` are the ones worth checking *before* you wait for any of them. A
+ * non-null `$notSent` means no email was ever attempted and none will be; a non-null `$failed`
+ * means one was attempted and BeaconBox has given up on it. Either way stop polling `$delivered`
+ * for this message, unless `$failed->reason` is `outcome_unknown`: a delivery can still arrive
+ * for that one, and clears `$failed`. See {@see NotSent} and {@see Failed}.
  */
 final class DeliveryStatus
 {
@@ -26,6 +28,7 @@ final class DeliveryStatus
         public readonly ?\DateTimeImmutable $bouncedAt = null,
         public readonly ?SmsDelivery $sms = null,
         public readonly ?NotSent $notSent = null,
+        public readonly ?Failed $failed = null,
         public readonly array $raw = [],
     ) {
     }
@@ -45,6 +48,9 @@ final class DeliveryStatus
                 : null,
             isset($payload['not_sent']) && \is_array($payload['not_sent'])
                 ? NotSent::fromArray($payload['not_sent'])
+                : null,
+            isset($payload['failed']) && \is_array($payload['failed'])
+                ? Failed::fromArray($payload['failed'])
                 : null,
             $payload,
         );

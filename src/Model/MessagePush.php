@@ -6,6 +6,7 @@ namespace BeaconBox\Model;
 
 use BeaconBox\Enum\Channel;
 use BeaconBox\Enum\MessageKind;
+use BeaconBox\Enum\OrderStatus;
 
 /**
  * One push, as an object.
@@ -21,6 +22,8 @@ use BeaconBox\Enum\MessageKind;
  *     subject: 'Your order has shipped',
  *     body: 'Tracking XY123456789EE.',
  *     kind: MessageKind::Updateable,
+ *     reference: '#A-10294',
+ *     orderStatus: OrderStatus::Shipped,
  * ));
  * ```
  *
@@ -41,18 +44,36 @@ final class MessagePush
      *                               estimate that moves twice before the parcel arrives.
      * @param string|null $reference Your own order number, for example `#A-10294`. Letters, digits
      *                               and `# - _ . /` only, no spaces, at most 32 characters. It
-     *                               appears in the WhatsApp nudge, which Meta reviews, so it has
-     *                               to be an identifier rather than a sentence.
+     *                               appears in the WhatsApp and the SMS nudge, so it has to be an
+     *                               identifier rather than a sentence, and a nudge shows it only
+     *                               when it passes a stricter display rule: an optional leading
+     *                               `#`, then a letter or digit, then letters, digits and
+     *                               `_ / # -`, with at most two dots, each directly before a digit
+     *                               (`INV.2026` is shown, `shop.com` is not). A reference that
+     *                               fails the rule is stored and echoed but never shown, and such
+     *                               a push sends no WhatsApp message.
      * @param string|null $recipientPhone Mobile number for the SMS nudge, E.164 preferred. Stored
      *                               against this recipient for your business and reused on later
-     *                               pushes, so it is optional once you have sent it once.
-     * @param list<Channel|string>|null $channels Override your account's channel settings for this
-     *                               one request. Null follows the account defaults. Listing both
-     *                               `sms` and `whatsapp` sends two messages and costs two credits.
-     *                               Email is always sent regardless. An explicit request overrides
-     *                               your account default only: it never overrides a country
-     *                               restriction, a recipient who opted out, or a recipient who
-     *                               never opted in to WhatsApp.
+     *                               pushes, so it is optional once you have sent it once. A
+     *                               number that cannot be parsed, or cannot be a recipient's
+     *                               phone (premium-rate, toll-free, shared-cost, voicemail,
+     *                               service, or a satellite or international code such as +881),
+     *                               refuses the whole push with a 422 (`sms.phone_invalid`) before
+     *                               anything is written, so you can correct it and retry with the
+     *                               same key.
+     * @param list<Channel|string>|null $channels Which paid channels this push asks for. **A
+     *                               request that can only narrow, never switch a channel on.**
+     *                               Null follows your account settings. Leaving a channel out
+     *                               suppresses it for this push. Naming one sends on it only where
+     *                               your settings already allow it: a channel in `off` mode stays
+     *                               off (`sms_disabled`, `whatsapp_disabled`), one BeaconBox has
+     *                               not yet enabled for your business never sends
+     *                               (`sms_not_enabled`, `whatsapp_not_enabled`), and one in
+     *                               `on_request` mode sends only on a push that names it. Naming a
+     *                               channel never overrides a country restriction, a recipient who
+     *                               opted out, or a recipient who never opted in to WhatsApp.
+     *                               Listing both `sms` and `whatsapp` sends two messages and costs
+     *                               two credits. Email is always sent regardless.
      * @param bool|null $notify      Null applies the default (create nudges, in-place update stays
      *                               silent). True forces a nudge on an update, false suppresses
      *                               one even on first create.
@@ -67,9 +88,20 @@ final class MessagePush
      *                               many minutes (5 to 10080). If they open it first, nothing is
      *                               sent and nothing is charged. That inverts what a paid channel
      *                               usually costs you: instead of paying to interrupt everybody,
-     *                               you pay only for the people the email did not reach.
+     *                               you pay only for the people the email did not reach. The
+     *                               minutes count from the email: from `$sendAt` when you set
+     *                               one, otherwise from the push, and if the email is still
+     *                               queued at the deadline it moves to this many minutes after
+     *                               the email goes. An email that bounced, failed or was skipped
+     *                               (a suppressed address, say) counts as unread, so the paid
+     *                               channel is still sent, subject to its own consent and
+     *                               settings: that is the case the paid channel exists for. Only
+     *                               a push that queued no nudge at all never escalates. A channel
+     *                               in `on_request` mode that this push named still sends at the
+     *                               deadline.
      * @param list<string> $obsoletes Ids of your earlier messages to grey out, for when this
-     *                               update replaces them.
+     *                               update replaces them. At most 100 ids of at most 64
+     *                               characters each; more is a 422.
      * @param string|null $whatsAppOptInSource Record that this recipient agreed to be messaged on
      *                               WhatsApp, naming the surface where they agreed in your own
      *                               words, for example `"checkout tickbox"`. This is the audit
@@ -78,8 +110,28 @@ final class MessagePush
      *                               your WhatsApp channel is still off. Consent is per business
      *                               and reaches no other merchant.
      * @param bool $smsIfWhatsAppFails Text this recipient if the WhatsApp nudge proves
-     *                               undeliverable. It does not fire for a message that was
-     *                               delivered and not read. The SMS costs its own credit.
+     *                               undeliverable: Meta refuses it, the delivery status comes back
+     *                               failed, or no status arrives within five minutes. It does not
+     *                               fire for a message that was delivered and not read. It also
+     *                               texts at once when WhatsApp cannot carry the message at all:
+     *                               the number is already known not to be on WhatsApp
+     *                               (`not_reachable`), or there is no template for it
+     *                               (`template_not_sendable` because the push lacks `$reference`
+     *                               or `$orderStatus`, or the reference or your business name
+     *                               cannot be shown); not while a template is still in review at
+     *                               Meta. At most one text either way. The SMS costs its own
+     *                               credit.
+     * @param OrderStatus|string|null $orderStatus What happened to the order, as an
+     *                               {@see OrderStatus} or its string value (`'shipped'`, say). A
+     *                               plain string is sent as given, so a status the API adds later
+     *                               works before this SDK knows it. BeaconBox picks the
+     *                               platform-written WhatsApp and SMS wording from it, for example
+     *                               "Your order #A-10294 from PhonicBloom has shipped." **A
+     *                               WhatsApp nudge needs both `$reference` and `$orderStatus`:**
+     *                               missing either, WhatsApp is skipped with
+     *                               `template_not_sendable` and nothing is charged. An in-place
+     *                               update replaces it, as it does `$reference`, so an update
+     *                               without it clears it.
      */
     public function __construct(
         public readonly string $recipientEmail,
@@ -95,6 +147,8 @@ final class MessagePush
         public readonly array $obsoletes = [],
         public readonly ?string $whatsAppOptInSource = null,
         public readonly bool $smsIfWhatsAppFails = false,
+        // Last, so a caller passing the parameters above positionally is not shifted by it.
+        public readonly OrderStatus|string|null $orderStatus = null,
     ) {
     }
 
@@ -118,6 +172,11 @@ final class MessagePush
 
         if ($this->reference !== null) {
             $payload['reference'] = $this->reference;
+        }
+        if ($this->orderStatus !== null) {
+            $payload['order_status'] = $this->orderStatus instanceof OrderStatus
+                ? $this->orderStatus->value
+                : $this->orderStatus;
         }
         if ($this->recipientPhone !== null) {
             $payload['recipient_phone'] = $this->recipientPhone;

@@ -27,4 +27,16 @@ class ApiException extends BeaconBoxException
     ) {
         parent::__construct($message);
     }
+
+    /**
+     * The `X-Request-Id` the API answered with, or null if the response carried none.
+     *
+     * Every response carries one. **Quote it to support**: it is the one value that finds this
+     * request in BeaconBox's logs. It is also in the exception message, so a logged exception
+     * already has it. The same value as the public `$requestId` property.
+     */
+    public function getRequestId(): ?string
+    {
+        return $this->requestId;
+    }
 }

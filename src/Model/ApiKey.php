@@ -14,6 +14,13 @@ final class ApiKey
         public readonly string $masked,
         public readonly \DateTimeImmutable $created,
         public readonly array $raw = [],
+        /**
+         * The id of the key that created this one through the API, detached or not; null for a
+         * key created in the dashboard (or by a server that predates the field). After a leak, a
+         * key still listed with the leaked key's id here was created detached with it and is
+         * still live.
+         */
+        public readonly ?string $mintedBy = null,
     ) {
     }
 
@@ -26,6 +33,7 @@ final class ApiKey
             Parse::string($payload, 'masked'),
             Parse::datetime($payload, 'created'),
             $payload,
+            Parse::nullableString($payload, 'minted_by'),
         );
     }
 }

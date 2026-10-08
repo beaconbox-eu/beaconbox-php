@@ -217,7 +217,10 @@ final class Transport
                         $status,
                         (int) round((microtime(true) - $started) * 1000),
                     ),
-                    $this->logContext($logName, $attempt, $headers) + ['status_code' => $status],
+                    $this->logContext($logName, $attempt, $headers) + [
+                        'status_code' => $status,
+                        'request_id' => self::requestId($responseHeaders),
+                    ],
                 );
             }
 
@@ -229,7 +232,14 @@ final class Transport
             $retryAfterMs = self::retryAfterMs($responseHeaders);
             if ($this->retryPolicy->shouldRetry($status, $attempt, $retryAfterMs)) {
                 $delay = $this->retryPolicy->delayMs($attempt, $retryAfterMs);
-                $this->logRetry($logName, $attempt, 'HTTP ' . $status, $delay, $headers);
+                $this->logRetry(
+                    $logName,
+                    $attempt,
+                    'HTTP ' . $status,
+                    $delay,
+                    $headers,
+                    self::requestId($responseHeaders),
+                );
                 $this->sleep($delay);
                 ++$attempt;
                 continue;
@@ -380,7 +390,8 @@ final class Transport
      * (`/recipients/buyer@example.com/sms`). The templated route is logged instead.
      *
      * The idempotency key *is* logged, because it is a random value identifying one attempt, and
-     * correlating retries without it is guesswork.
+     * correlating retries without it is guesswork. So is the response's `X-Request-Id`, as
+     * `request_id`: it is the value support asks for, and the server mints it at random.
      *
      * @param array<string, string> $headers
      *
@@ -402,10 +413,19 @@ final class Transport
      * It names the idempotency key so a reader can see the retry reused it. A retry that minted a
      * fresh key would be a duplicate message, and this line is where that would be visible.
      *
+     * The response's request id rides along when there was a response to retry, so the line can
+     * be quoted to support.
+     *
      * @param array<string, string> $headers
      */
-    private function logRetry(string $logName, int $attempt, string $reason, int $delayMs, array $headers): void
-    {
+    private function logRetry(
+        string $logName,
+        int $attempt,
+        string $reason,
+        int $delayMs,
+        array $headers,
+        ?string $requestId = null,
+    ): void {
         $this->logger->warning(
             sprintf(
                 'BeaconBox retrying %s after %s, attempt %d in %dms',
@@ -417,7 +437,7 @@ final class Transport
             $this->logContext($logName, $attempt, $headers) + [
                 'reason' => $reason,
                 'retry_in_ms' => $delayMs,
-            ],
+            ] + ($requestId === null ? [] : ['request_id' => $requestId]),
         );
     }
 
@@ -481,15 +501,14 @@ final class Transport
         $decoded = $this->decode($body);
         $code = \is_string($decoded['error_code'] ?? null) ? $decoded['error_code'] : null;
         $detail = \is_string($decoded['detail'] ?? null) ? $decoded['detail'] : null;
-        $message = sprintf('BeaconBox: %s (HTTP %d)', $detail ?? $code ?? 'request failed', $status);
-
-        $requestId = null;
-        foreach ($headers as $name => $value) {
-            if (strtolower($name) === 'x-request-id') {
-                $requestId = $value;
-                break;
-            }
-        }
+        $requestId = self::requestId($headers);
+        // The request id goes in the message as well as on the property, because the message is
+        // what reaches a log line or a bug report, and it is the one value support can search for.
+        $message = sprintf(
+            'BeaconBox: %s (%s)',
+            $detail ?? $code ?? 'request failed',
+            $requestId === null ? 'HTTP ' . $status : sprintf('HTTP %d, request %s', $status, $requestId),
+        );
 
         $class = match (true) {
             $status === 401 => AuthenticationException::class,
@@ -502,6 +521,22 @@ final class Transport
         };
 
         return new $class($message, $status, $code, $decoded, $requestId, self::retryAfterMs($headers));
+    }
+
+    /**
+     * The response's `X-Request-Id`, matched case-insensitively, or null.
+     *
+     * @param array<string, string> $headers
+     */
+    private static function requestId(array $headers): ?string
+    {
+        foreach ($headers as $name => $value) {
+            if (strtolower($name) === 'x-request-id' && $value !== '') {
+                return $value;
+            }
+        }
+
+        return null;
     }
 
     /**

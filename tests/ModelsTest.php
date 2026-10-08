@@ -5,18 +5,25 @@ declare(strict_types=1);
 namespace BeaconBox\Tests;
 
 use BeaconBox\Enum\Channel;
+use BeaconBox\Enum\EmailFailureReason;
 use BeaconBox\Enum\EmailSkipReason;
 use BeaconBox\Enum\MessageKind;
 use BeaconBox\Enum\MessageStatus;
+use BeaconBox\Enum\OrderStatus;
 use BeaconBox\Enum\RecipientStatus;
 use BeaconBox\Enum\SkipReason;
+use BeaconBox\Enum\SmsConsentSource;
+use BeaconBox\Enum\WebhookEventType;
+use BeaconBox\Model\BatchResult;
 use BeaconBox\Model\DeliveryStatus;
 use BeaconBox\Model\Message;
 use BeaconBox\Model\MessagePush;
 use BeaconBox\Model\MessagePushResult;
+use BeaconBox\Model\RecipientErasureReport;
 use BeaconBox\Model\SmsOutcome;
 use BeaconBox\Model\WebhookEvent;
 use BeaconBox\Model\WebhookTestResult;
+use BeaconBox\Model\WhatsAppOutcome;
 use BeaconBox\Tests\Support\Fake;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
@@ -316,6 +323,69 @@ final class ModelsTest extends TestCase
         self::assertSame(['sms', 'whatsapp'], $payload['channels']);
     }
 
+    // --- Order status --------------------------------------------------------------------
+
+    public function testAnOrderStatusCaseSerialisesToItsValue(): void
+    {
+        $payload = (new MessagePush('a@b.c', 's', 'b', orderStatus: OrderStatus::Shipped))->toArray();
+
+        self::assertSame('shipped', $payload['order_status']);
+    }
+
+    public function testAPlainStringOrderStatusPassesThrough(): void
+    {
+        // So a status the API adds later can be sent before this SDK knows it.
+        $payload = (new MessagePush('a@b.c', 's', 'b', orderStatus: 'out_for_delivery'))->toArray();
+
+        self::assertSame('out_for_delivery', $payload['order_status']);
+    }
+
+    public function testAnUnsetOrderStatusIsOmitted(): void
+    {
+        self::assertArrayNotHasKey('order_status', (new MessagePush('a@b.c', 's', 'b'))->toArray());
+    }
+
+    public function testTheOrderStatusesCarryTheWireValuesInOrder(): void
+    {
+        self::assertSame(
+            ['confirmed', 'shipped', 'ready_for_pickup', 'delivered', 'cancelled', 'refunded', 'delayed'],
+            array_map(static fn (OrderStatus $s): string => $s->value, OrderStatus::cases()),
+        );
+    }
+
+    public function testAKnownOrderStatusReadsBackAsTheCase(): void
+    {
+        $result = MessagePushResult::fromArray([...Fake::pushResult(), 'order_status' => 'ready_for_pickup']);
+
+        self::assertSame(OrderStatus::ReadyForPickup, $result->orderStatus);
+    }
+
+    public function testAnUnknownOrderStatusStaysAPlainString(): void
+    {
+        // The list grows on the server. A status this SDK has not heard of must not fatal.
+        $result = MessagePushResult::fromArray([...Fake::pushResult(), 'order_status' => 'out_for_delivery']);
+
+        self::assertSame('out_for_delivery', $result->orderStatus);
+    }
+
+    public function testAnAbsentNullOrMalformedOrderStatusReadsAsNull(): void
+    {
+        self::assertNull(MessagePushResult::fromArray(Fake::pushResult())->orderStatus);
+        self::assertNull(MessagePushResult::fromArray([...Fake::pushResult(), 'order_status' => null])->orderStatus);
+        self::assertNull(MessagePushResult::fromArray([...Fake::pushResult(), 'order_status' => 7])->orderStatus);
+    }
+
+    public function testABatchItemCarriesTheOrderStatusToo(): void
+    {
+        $batch = BatchResult::fromArray([
+            'items' => [['index' => 0, 'ok' => true, 'result' => [...Fake::pushResult(), 'order_status' => 'shipped']]],
+            'succeeded' => 1,
+            'failed' => 0,
+        ]);
+
+        self::assertSame(OrderStatus::Shipped, $batch->items[0]->result?->orderStatus);
+    }
+
     // --- Nested ------------------------------------------------------------------------
 
     public function testAMessageParsesItsWholeDeliveryTree(): void
@@ -377,6 +447,186 @@ final class ModelsTest extends TestCase
         self::assertNotNull($delivery->notSent);
         self::assertSame('some_future_reason', $delivery->notSent->reason);
         self::assertNull($delivery->notSent->at);
+    }
+
+    // --- delivery.failed -------------------------------------------------------------------
+
+    public function testADeliveryWithNoFailureHasNoFailedBlock(): void
+    {
+        $delivery = DeliveryStatus::fromArray(['delivered' => false, 'opened' => false, 'bounced' => false]);
+
+        self::assertNull($delivery->failed);
+    }
+
+    public function testAFailureCarriesItsReasonAndTime(): void
+    {
+        $delivery = DeliveryStatus::fromArray([
+            'delivered' => false,
+            'opened' => false,
+            'bounced' => false,
+            'not_sent' => null,
+            'failed' => ['reason' => 'esp_refused', 'at' => '2026-10-07T08:00:00Z'],
+        ]);
+
+        self::assertNull($delivery->notSent);
+        self::assertNotNull($delivery->failed);
+        self::assertSame(EmailFailureReason::EspRefused->value, $delivery->failed->reason);
+        self::assertSame('2026-10-07T08:00:00+00:00', $delivery->failed->at?->format(\DATE_ATOM));
+        self::assertSame(['reason' => 'esp_refused', 'at' => '2026-10-07T08:00:00Z'], $delivery->failed->raw);
+    }
+
+    public function testAnUnknownFailureReasonParsesRatherThanThrowing(): void
+    {
+        $delivery = DeliveryStatus::fromArray([
+            'delivered' => false,
+            'opened' => false,
+            'bounced' => false,
+            'failed' => ['reason' => 'provider_on_fire', 'at' => 'not a date'],
+        ]);
+
+        self::assertNotNull($delivery->failed);
+        self::assertSame('provider_on_fire', $delivery->failed->reason);
+        self::assertNull($delivery->failed->at);
+    }
+
+    #[DataProvider('notAnObject')]
+    public function testAFailedFieldThatIsNotAnObjectReadsAsAbsent(mixed $value): void
+    {
+        $delivery = DeliveryStatus::fromArray([
+            'delivered' => false,
+            'opened' => false,
+            'bounced' => false,
+            'failed' => $value,
+        ]);
+
+        self::assertNull($delivery->failed);
+    }
+
+    /** @return iterable<string, array{mixed}> */
+    public static function notAnObject(): iterable
+    {
+        yield 'null' => [null];
+        yield 'string' => ['esp_refused'];
+        yield 'int' => [7];
+    }
+
+    public function testTheNewEnumsCarryTheWireValues(): void
+    {
+        self::assertSame('retries_exhausted', EmailFailureReason::RetriesExhausted->value);
+        self::assertSame('outcome_unknown', EmailFailureReason::OutcomeUnknown->value);
+        self::assertSame('business_inactive', EmailSkipReason::BusinessInactive->value);
+        self::assertSame('message.failed', WebhookEventType::MessageFailed->value);
+        self::assertSame(
+            ['push', 'api', 'admin', 'inbox'],
+            array_map(static fn (SmsConsentSource $s): string => $s->value, SmsConsentSource::cases()),
+        );
+    }
+
+    public function testAPushResultCarriesTheNormalisedRecipient(): void
+    {
+        $result = MessagePushResult::fromArray([...Fake::pushResult(), 'recipient_email' => 'buyer@example.com']);
+
+        self::assertSame('buyer@example.com', $result->recipientEmail);
+    }
+
+    public function testAPushResultWithoutTheRecipientReadsAsNull(): void
+    {
+        // A replay of a response recorded before the field existed carries null.
+        self::assertNull(MessagePushResult::fromArray([...Fake::pushResult(), 'recipient_email' => null])->recipientEmail);
+        self::assertNull(MessagePushResult::fromArray([...Fake::pushResult(), 'recipient_email' => 7])->recipientEmail);
+    }
+
+    public function testABatchItemCarriesTheRecipientToo(): void
+    {
+        $batch = BatchResult::fromArray([
+            'items' => [['index' => 0, 'ok' => true, 'result' => [...Fake::pushResult(), 'recipient_email' => 'a@example.com']]],
+            'succeeded' => 1,
+            'failed' => 0,
+        ]);
+
+        self::assertSame('a@example.com', $batch->items[0]->result?->recipientEmail);
+    }
+
+    // --- The reasons that make `channels` a request that can only narrow -------------------
+
+    public function testTheNewSkipReasonsAreKnown(): void
+    {
+        foreach (['sms_not_enabled', 'sms_warmup_cap_reached', 'sms_disabled'] as $wire) {
+            $outcome = SmsOutcome::fromArray(['queued' => false, 'credits' => 1, 'skipped_reason' => $wire]);
+            self::assertNotNull(SkipReason::tryFrom((string) $outcome->skippedReason), $wire);
+        }
+
+        $whatsApp = WhatsAppOutcome::fromArray([
+            'queued' => false,
+            'credits' => 1,
+            'skipped_reason' => 'whatsapp_not_enabled',
+        ]);
+        self::assertSame(SkipReason::WhatsAppNotEnabled->value, $whatsApp->skippedReason);
+    }
+
+    public function testASkipReasonAddedAfterThisSdkStillParses(): void
+    {
+        $outcome = SmsOutcome::fromArray(['queued' => false, 'credits' => 1, 'skipped_reason' => 'sms_reason_from_2027']);
+
+        self::assertSame('sms_reason_from_2027', $outcome->skippedReason);
+    }
+
+    public function testAResendOutcomeWithoutASkippedReasonIsQueued(): void
+    {
+        // `skipped_reason` is optional on the resend response, and absent when it went.
+        $outcome = SmsOutcome::fromArray(['queued' => true, 'credits' => 1]);
+
+        self::assertTrue($outcome->queued);
+        self::assertNull($outcome->skippedReason);
+    }
+
+    // --- RecipientErasureReport -------------------------------------------------------------
+
+    public function testAnErasureReportReadsEveryCount(): void
+    {
+        $payload = [
+            'messages_deleted' => 3,
+            'message_events_deleted' => 9,
+            'channel_sends_deleted' => 2,
+            'message_links_deleted' => 3,
+            'whatsapp_replies_deleted' => 1,
+            'webhook_payloads_scrubbed' => 4,
+            'queued_jobs_cancelled' => 1,
+            'idempotency_records_deleted' => 5,
+            'audit_entries_pseudonymised' => 2,
+            'subscription_deleted' => true,
+            'stops_kept' => 1,
+            'suppressions_kept' => 1,
+            'auto_reply_windows_dropped' => 1,
+            'replies_a_forward_email_may_have_carried' => 1,
+        ];
+
+        $report = RecipientErasureReport::fromArray($payload);
+
+        self::assertSame(3, $report->messagesDeleted);
+        self::assertSame(9, $report->messageEventsDeleted);
+        self::assertSame(2, $report->channelSendsDeleted);
+        self::assertSame(3, $report->messageLinksDeleted);
+        self::assertSame(1, $report->whatsAppRepliesDeleted);
+        self::assertSame(4, $report->webhookPayloadsScrubbed);
+        self::assertSame(1, $report->queuedJobsCancelled);
+        self::assertSame(5, $report->idempotencyRecordsDeleted);
+        self::assertSame(2, $report->auditEntriesPseudonymised);
+        self::assertTrue($report->subscriptionDeleted);
+        self::assertSame(1, $report->stopsKept);
+        self::assertSame(1, $report->suppressionsKept);
+        self::assertSame(1, $report->autoReplyWindowsDropped);
+        self::assertSame(1, $report->repliesAForwardEmailMayHaveCarried);
+        self::assertSame($payload, $report->raw);
+    }
+
+    public function testARepeatErasureReadsAsZeros(): void
+    {
+        $report = RecipientErasureReport::fromArray(['messages_deleted' => null, 'future_count' => 7]);
+
+        self::assertSame(0, $report->messagesDeleted);
+        self::assertFalse($report->subscriptionDeleted);
+        self::assertSame(7, $report->raw['future_count']);
     }
 
     public function testAWebhookEventKeepsItsDataUntouched(): void

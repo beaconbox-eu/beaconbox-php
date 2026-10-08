@@ -18,6 +18,7 @@ declare(strict_types=1);
  */
 
 use BeaconBox\BeaconBoxClient;
+use BeaconBox\Enum\OrderStatus;
 use BeaconBox\Exception\InvalidRequestException;
 use BeaconBox\Model\BatchItemResult;
 use BeaconBox\Model\MessagePush;
@@ -53,6 +54,7 @@ $first = $client->messages->push(new MessagePush(
     subject: "Order #{$run} is on its way",
     body: 'Your order shipped today. Tracking: XX000000000XX.',
     reference: "#{$run}",
+    orderStatus: OrderStatus::Shipped,
 ));
 check('push accepted', $first->created && $first->nudged);
 // The per-channel block. On a clean recipient this must report sending; if it does not, the

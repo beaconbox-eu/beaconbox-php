@@ -6,6 +6,7 @@ namespace BeaconBox\Model;
 
 use BeaconBox\Enum\MessageKind;
 use BeaconBox\Enum\MessageStatus;
+use BeaconBox\Enum\OrderStatus;
 
 /**
  * What a push returns.
@@ -38,7 +39,15 @@ final class MessagePushResult
      *                                           not sending: an account collecting consent ahead
      *                                           of switching the channel on has no `$whatsapp`
      *                                           block at all.
+     * @param string|null          $recipientEmail The recipient this message was stored for, as
+     *                                           BeaconBox normalised it (trimmed, lower case).
+     *                                           Null only when an idempotent replay returns a
+     *                                           response recorded before the API started
+     *                                           sending it.
      * @param array<string, mixed> $raw
+     * @param OrderStatus|string|null $orderStatus The `orderStatus` the push carried, or null
+     *                                           when it carried none. A value this SDK does not
+     *                                           know stays a plain string.
      */
     public function __construct(
         public readonly string $id,
@@ -56,7 +65,10 @@ final class MessagePushResult
         public readonly ?WhatsAppOutcome $whatsapp = null,
         public readonly ?WhatsAppOptInOutcome $whatsappOptIn = null,
         public readonly ?string $reference = null,
+        public readonly ?string $recipientEmail = null,
         public readonly array $raw = [],
+        // Last, so positional construction is not shifted by it.
+        public readonly OrderStatus|string|null $orderStatus = null,
     ) {
     }
 
@@ -67,6 +79,10 @@ final class MessagePushResult
         $kind = Parse::enum(MessageKind::class, $payload, 'kind');
         /** @var MessageStatus|string $status */
         $status = Parse::enum(MessageStatus::class, $payload, 'status');
+        /** @var OrderStatus|string|null $orderStatus */
+        $orderStatus = \is_string($payload['order_status'] ?? null)
+            ? Parse::enum(OrderStatus::class, $payload, 'order_status')
+            : null;
 
         return new self(
             Parse::string($payload, 'id'),
@@ -92,7 +108,9 @@ final class MessagePushResult
                 ? WhatsAppOptInOutcome::fromArray($payload['whatsapp_opt_in'])
                 : null,
             Parse::nullableString($payload, 'reference'),
+            Parse::nullableString($payload, 'recipient_email'),
             $payload,
+            $orderStatus,
         );
     }
 }

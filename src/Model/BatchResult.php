@@ -5,10 +5,14 @@ declare(strict_types=1);
 namespace BeaconBox\Model;
 
 /**
- * What a batch returns. **Always HTTP 200: check `$failed`, not the status code.**
+ * What a batch returns. **HTTP 200 whenever the batch is processed: check `$failed`, not the
+ * status code.**
  *
  * An item that failed is reported, not thrown. One bad recipient must not discard the forty-nine
- * good pushes alongside it, and a 4xx for the whole call would invite a retry of all fifty.
+ * good pushes alongside it, and a 4xx for the whole call would invite a retry of all fifty. The
+ * one refusal of the whole batch is a 409 `idempotency.request_in_progress`, thrown as a
+ * {@see \BeaconBox\Exception\ConflictException} while the same key is still running it: retry
+ * the whole batch later with the same key, and items already sent are replayed.
  */
 final class BatchResult
 {

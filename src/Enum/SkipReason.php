@@ -18,6 +18,8 @@ namespace BeaconBox\Enum;
  * - `NoPhone` and `PhoneConflict` are data problems on your side.
  * - `Stopped`, `Unsubscribed` and `NotOptedIn` are the recipient's choice. Do not route around
  *   them.
+ * - `SmsNotEnabled` and `WhatsAppNotEnabled` mean BeaconBox has not switched that channel on for
+ *   your business yet. Ask for it from the dashboard.
  * - The rest are account or destination settings.
  *
  * Values not listed here can appear. Models expose `skippedReason` as a plain `?string` for that
@@ -31,7 +33,23 @@ enum SkipReason: string
     /** Your own `channels` argument left this channel out. */
     case DisabledByRequest = 'disabled_by_request';
 
+    /** SMS has not been enabled for your business yet. Naming `sms` in `channels` does not change that. */
+    case SmsNotEnabled = 'sms_not_enabled';
+
+    /** Your SMS mode is `off`. Final: naming `sms` in `channels` does not override it. */
     case SmsDisabled = 'sms_disabled';
+
+    /**
+     * A newly enabled business sends a limited number of texts a day while it warms up. Decided
+     * when the send runs, so it reaches you on the message's `delivery->sms` rather than in the
+     * push response.
+     */
+    case SmsWarmupCapReached = 'sms_warmup_cap_reached';
+
+    /** WhatsApp has not been enabled for your business yet. */
+    case WhatsAppNotEnabled = 'whatsapp_not_enabled';
+
+    /** Your WhatsApp mode is `off`. Final, like `SmsDisabled`. */
     case WhatsAppDisabled = 'whatsapp_disabled';
     case CountryNotAllowed = 'country_not_allowed';
     case NoPhone = 'no_phone';

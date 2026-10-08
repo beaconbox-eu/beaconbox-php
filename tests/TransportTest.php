@@ -6,6 +6,7 @@ namespace BeaconBox\Tests;
 
 use BeaconBox\BeaconBoxClient;
 use BeaconBox\Exception\ApiConnectionException;
+use BeaconBox\Exception\ApiException;
 use BeaconBox\Exception\AuthenticationException;
 use BeaconBox\Exception\ConflictException;
 use BeaconBox\Exception\InvalidRequestException;
@@ -433,6 +434,90 @@ final class TransportTest extends TestCase
             self::fail('expected ServerException');
         } catch (ServerException $thrown) {
             self::assertSame('req_9', $thrown->requestId);
+            self::assertSame('req_9', $thrown->getRequestId());
+        }
+    }
+
+    public function testTheRequestIdIsInTheMessageToo(): void
+    {
+        // The message is what reaches a log line or a bug report, so it carries the id support
+        // asks for without anybody having to know the property exists.
+        [$client] = Fake::client([new Response(409, ['x-request-id' => '3f2a9c'], '{"error_code":"request.conflict"}')]);
+
+        try {
+            $client->credits->balance();
+            self::fail('expected ConflictException');
+        } catch (ConflictException $thrown) {
+            self::assertSame('request.conflict', $thrown->errorCode);
+            self::assertStringContainsString('HTTP 409, request 3f2a9c', $thrown->getMessage());
+        }
+    }
+
+    public function testNoRequestIdLeavesTheMessageAsItWas(): void
+    {
+        [$client] = Fake::client([new Response(500, [], '{}')]);
+
+        try {
+            $client->credits->balance();
+            self::fail('expected ServerException');
+        } catch (ServerException $thrown) {
+            self::assertNull($thrown->getRequestId());
+            self::assertStringEndsWith('(HTTP 500)', $thrown->getMessage());
+        }
+    }
+
+    public function testTheTestPingRateLimitIsARateLimitException(): void
+    {
+        [$client] = Fake::client([Fake::json(429, ['error_code' => 'webhook.test_rate_limited'])]);
+
+        try {
+            $client->webhookEndpoints->test('we_1');
+            self::fail('expected RateLimitException');
+        } catch (RateLimitException $thrown) {
+            self::assertSame('webhook.test_rate_limited', $thrown->errorCode);
+        }
+    }
+
+    /** @return list<array{int, string, class-string<\Throwable>}> */
+    public static function codesTheReleaseAdded(): array
+    {
+        return [
+            [413, 'request.too_large', InvalidRequestException::class],
+            [422, 'request.unstorable_input', InvalidRequestException::class],
+            [403, 'plan.read_only', PermissionException::class],
+        ];
+    }
+
+    /** @param class-string<\Throwable> $expected */
+    #[DataProvider('codesTheReleaseAdded')]
+    public function testTheNewCodesMapByStatus(int $status, string $code, string $expected): void
+    {
+        [$client, $http] = Fake::client([Fake::json($status, ['error_code' => $code])]);
+
+        try {
+            $client->keys->create('orders service');
+            self::fail('expected ' . $expected);
+        } catch (ApiException $thrown) {
+            self::assertInstanceOf($expected, $thrown);
+            self::assertSame($code, $thrown->errorCode);
+            self::assertSame($status, $thrown->statusCode);
+        }
+        // A 4xx is the same answer the second time, so none of these is retried.
+        self::assertCount(1, $http->requests);
+    }
+
+    public function testA413FromAProxyIsStillAnInvalidRequest(): void
+    {
+        // A proxy in front of the API can refuse an oversized body before BeaconBox sees it, with
+        // no JSON and so no error code. The status alone has to pick the class.
+        [$client] = Fake::client([new Response(413, [], 'Request Entity Too Large')]);
+
+        try {
+            $client->credits->balance();
+            self::fail('expected InvalidRequestException');
+        } catch (InvalidRequestException $thrown) {
+            self::assertSame(413, $thrown->statusCode);
+            self::assertNull($thrown->errorCode);
         }
     }
 

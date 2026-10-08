@@ -36,6 +36,19 @@ use BeaconBox\Model\WhatsAppOutcome;
  *     // Top up, then: $client->messages->resendSms($result->id);
  * }
  * ```
+ *
+ * **`channels` can only narrow, never switch a channel on.** On an account whose SMS mode is
+ * `off`, or where BeaconBox has not enabled SMS yet, the push above still succeeds and reports why
+ * no text went out:
+ *
+ * ```php
+ * if (\in_array($result->sms?->skippedReason, [
+ *     SkipReason::SmsDisabled->value,
+ *     SkipReason::SmsNotEnabled->value,
+ * ], true)) {
+ *     // the email went; turn SMS on in the dashboard to text as well
+ * }
+ * ```
  */
 final class Messages extends BaseResource
 {
@@ -45,10 +58,19 @@ final class Messages extends BaseResource
      * The customer gets an email whose link opens their inbox already signed in. No password, no
      * account to create.
      *
+     * `channels` on the message can only narrow what your account settings allow and never
+     * switches a channel on; see {@see MessagePush}. A channel that is off or not yet enabled is
+     * reported as a `skippedReason` on a 201, never thrown.
+     *
      * `$idempotencyKey` is optional and generated when omitted. **Pass your own whenever you have
      * a natural key**, an order id or a job id, because then a retry from *anywhere* (your queue,
      * a cron, a human clicking twice) collapses onto the same key rather than only the retries
      * this SDK makes internally.
+     *
+     * A request body over 2 MiB is refused with an
+     * {@see \BeaconBox\Exception\InvalidRequestException} (HTTP 413, `request.too_large`), and
+     * text containing a NUL character or a lone surrogate with `request.unstorable_input` (422).
+     * Neither is retried: the same body is refused again.
      *
      * @param MessagePush|array<string, mixed> $message A {@see MessagePush} for named arguments
      *                                                  and editor completion, or a raw array for
@@ -70,12 +92,29 @@ final class Messages extends BaseResource
      * A list of complete, individual pushes, not one message fanned out to many recipients: fifty
      * orders means fifty tracking numbers.
      *
-     * **Always answers 200. Read `$result->failed`, not the status code.** One rejected item does
-     * not fail the batch, because a batch that aborted at item 7 would leave items 8 onwards
-     * unsent with nothing to say which.
+     * **Answers 200 whenever the batch is processed. Read `$result->failed`, not the status
+     * code.** One rejected item does not fail the batch, because a batch that aborted at item 7
+     * would leave items 8 onwards unsent with nothing to say which.
+     *
+     * **The one whole-batch refusal is a 409**, thrown as a
+     * {@see \BeaconBox\Exception\ConflictException} with `errorCode`
+     * `idempotency.request_in_progress`: another request with the same key is still running this
+     * batch, or took it over while this one ran. It is never an item's result, and the SDK does not
+     * retry it. Wait a few seconds and retry the whole batch with the same key: items already sent
+     * are replayed, and every item's real outcome comes back.
      *
      * **Safe to retry with the same key.** Items that already went out are replayed rather than
-     * sent a second time, including after a crash partway through the batch.
+     * sent a second time, including after a crash partway through the batch. Each item's own key
+     * is the batch key with `#<index>` appended, so a batch `$idempotencyKey` is limited to 252
+     * characters rather than 255; a longer one is refused with an
+     * {@see \BeaconBox\Exception\InvalidRequestException} before anything runs.
+     *
+     * Each item's `channels` follows the same rule as {@see self::push()}: it can only narrow
+     * what your account settings allow, never switch a channel on.
+     *
+     * The whole request body may be at most 8 MiB. A larger one is refused as a whole, before any
+     * item runs, with an {@see \BeaconBox\Exception\InvalidRequestException} (HTTP 413,
+     * `request.too_large`): split it into smaller batches.
      *
      * @param list<MessagePush|array<string, mixed>> $messages
      */
@@ -182,9 +221,15 @@ final class Messages extends BaseResource
      * The recovery path for a `skippedReason`, most often an empty balance that has since been
      * topped up.
      *
-     * Refused with a {@see \BeaconBox\Exception\ConflictException} if one is already queued or
-     * delivered: the only thing a second send would add is a second charge and a second
-     * interruption.
+     * Refused with a {@see \BeaconBox\Exception\ConflictException} (`sms.already_sent`) while
+     * one is still queued for sending, or after one was accepted or delivered: the only thing a
+     * second send would add is a second charge and a second interruption. The refusal is decided
+     * before anything is written, so the idempotency key stays unspent.
+     *
+     * A policy refusal is not an exception: it comes back as the outcome's `skippedReason`, which
+     * is null when the text was queued. Calling this counts as naming the channel, so an
+     * `on_request` account sends; an `off` one, or one BeaconBox has not enabled for SMS, still
+     * does not.
      */
     public function resendSms(string $publicId, ?string $idempotencyKey = null): SmsOutcome
     {
@@ -201,6 +246,11 @@ final class Messages extends BaseResource
      *
      * A separate call rather than a channel parameter, because a request naming both channels
      * would have to mean charging twice and interrupting twice for one update.
+     *
+     * Refused with a {@see \BeaconBox\Exception\ConflictException} as `whatsapp.already_sent`
+     * while a WhatsApp send is still queued or after one was delivered or read, and as
+     * `whatsapp.escalated_to_sms` when `smsIfWhatsAppFails` has already texted them.
+     * `skippedReason` on the outcome is null when the message was queued.
      */
     public function resendWhatsApp(string $publicId, ?string $idempotencyKey = null): WhatsAppOutcome
     {

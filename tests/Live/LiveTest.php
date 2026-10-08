@@ -296,8 +296,13 @@ final class LiveTest extends TestCase
 
     public function testAnUnknownIdIsA404(): void
     {
-        $this->expectException(ResourceMissingException::class);
-        $this->client()->messages->get('m_definitelynotreal');
+        try {
+            $this->client()->messages->get('m_definitelynotreal');
+            self::fail('expected ResourceMissingException');
+        } catch (ResourceMissingException $thrown) {
+            // Every response carries one, and it is what support asks for.
+            self::assertNotNull($thrown->getRequestId());
+        }
     }
 
     // --- Other resources -----------------------------------------------------------------
@@ -319,6 +324,19 @@ final class LiveTest extends TestCase
 
         $cleared = $this->client()->recipients->clearPhone(self::$recipient);
         self::assertNull($cleared->phone);
+    }
+
+    public function testErasingARecipientDeletesTheirMessages(): void
+    {
+        // A throwaway address, so erasing it cannot disturb the seeded recipient.
+        $address = 'erase-' . bin2hex(random_bytes(5)) . '@example.com';
+        $pushed = $this->client()->messages->push(new MessagePush($address, 'Erase me', 'Gone.'));
+
+        $report = $this->client()->recipients->erase($address);
+
+        self::assertGreaterThanOrEqual(1, $report->messagesDeleted);
+        $this->expectException(ResourceMissingException::class);
+        $this->client()->messages->get($pushed->id);
     }
 
     public function testKeysCreateListRevoke(): void

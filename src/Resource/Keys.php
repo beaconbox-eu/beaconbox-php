@@ -34,13 +34,31 @@ final class Keys extends BaseResource
      * The returned `->key` is unrecoverable. Write it to a secret store before the process exits.
      * Its `var_dump` output is redacted so an incidental debug line cannot leak it, so read the
      * property explicitly.
+     *
+     * **A key minted with a key is revoked with it**, and with any key above it, unless it was
+     * minted with `detach: true`. To rotate, pass `detach: true`: the new key keeps working after
+     * you revoke the key this client uses. Mint it, move your systems to it, then {@see revoke()}
+     * the old one. A leaked key can mint a detached key too, so after revoking one, list the keys
+     * and revoke any whose `mintedBy` is the leaked key's id.
+     *
+     * Refused with a {@see \BeaconBox\Exception\PermissionException} (`plan.read_only`) while your
+     * plan has lapsed: pay, and minting works again.
      */
-    public function create(?string $name = null, ?string $idempotencyKey = null): NewApiKey
-    {
+    public function create(
+        ?string $name = null,
+        ?string $idempotencyKey = null,
+        bool $detach = false,
+    ): NewApiKey {
+        $body = ['name' => $name];
+        // Sent only when asked for, so a plain create is the same request it always was.
+        if ($detach) {
+            $body['detach'] = true;
+        }
+
         return NewApiKey::fromArray($this->transport->request(
             'POST',
             '/keys',
-            ['name' => $name],
+            $body,
             idempotencyKey: $idempotencyKey,
         ));
     }
@@ -49,7 +67,9 @@ final class Keys extends BaseResource
      * Revoke a key immediately. In-flight requests using it start failing with 401.
      *
      * Revoking the key this client is authenticated with is allowed, and is the correct response
-     * to a leak even though the next call from this client will fail.
+     * to a leak even though the next call from this client will fail. Every key minted with it (and
+     * not detached) is revoked too, and the keys those minted in turn. A detached key it minted is
+     * not: find those by `mintedBy` in {@see list()}.
      */
     public function revoke(string $keyId): void
     {

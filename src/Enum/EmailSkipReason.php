@@ -17,17 +17,24 @@ namespace BeaconBox\Enum;
  * ```
  *
  * The three worth branching on are `PlanLapsed` (pay, and sending resumes), `DailyCapReached`
- * (nothing is wrong; the day's allowance ran out) and `Suppressed` (that address will never be
- * emailed again for you).
+ * (nothing is wrong; the day's allowance ran out, and the update needs pushing again because it is
+ * not retried) and `Suppressed` (that address will never be emailed again for you).
  */
 enum EmailSkipReason: string
 {
     /** The subscription no longer pays for email. Nothing was attempted. */
     case PlanLapsed = 'plan_lapsed';
-    /** The sending domain's daily cap was reached. Later messages that day are also refused. */
+    /**
+     * The sending domain's daily cap was reached. Later messages that day are also refused.
+     *
+     * **Requires a resend.** The decision is final for this send: the nudge is not retried when
+     * the cap resets, so push again the next day if the update still matters.
+     */
     case DailyCapReached = 'daily_cap_reached';
     /** Sending is paused for this business — by the complaint monitor or by BeaconBox staff. */
     case SendingPaused = 'sending_paused';
+    /** Your business has been deactivated, so nothing is sent for it. */
+    case BusinessInactive = 'business_inactive';
     /** This address hard-bounced or complained for you, and is on your suppression list. */
     case Suppressed = 'suppressed';
     /** This address hard-bounced for another merchant on the shared sending domain. */
